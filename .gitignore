@@ -1,0 +1,6 @@
+.venv
+dags/__pycache__
+logs
+secrets
+.envdata
+data

@@ -1,0 +1,9 @@
+apache-airflow-providers-postgres
+beautifulsoup4>=4.12
+google-auth
+gspread
+lxml>=5.0
+pandas
+psycopg2-binary
+requests>=2.31
+sentence-transformers
