@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Parse ForteMarket auto products into master-catalog compatible CSV files.
+Parse ForteMarket auto products through its public JSON API.
 
-The scraper intentionally uses CloakBrowser for the browsing/session layer and
-calls ForteMarket JSON endpoints from inside the page context.
+The parser uses a regular requests.Session and writes a separate CSV for tires,
+oils, filters, and batteries.
 """
 
 from __future__ import annotations
@@ -11,12 +11,14 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -92,6 +94,40 @@ CORE_AUTO_CATEGORY_RULES = {
 }
 
 CORE_AUTO_CATEGORY_IDS = set(CORE_AUTO_CATEGORY_RULES)
+
+GROUP_OUTPUT_COLUMNS = {
+    "tires": [
+        "product_id", "name", "price", "url", "slug", "images", "brand",
+        "season", "size", "width", "height", "diameter",
+        "weight_single_index", "weight_double_index", "velocity_index",
+        "quantity_available", "tyre_auto_type_name", "tyre_stud_type_name",
+        "is_ecar", "article_sku", "rating", "reviews_count", "seller_count",
+        "model_name", "weight",
+    ],
+    "oils": [
+        "product_id", "name", "price", "url", "slug", "category",
+        "brand_name", "images", "Вид масла", "Класс API",
+        "Класс вязкости SAE", "Объем упаковки, л", "Область применения",
+        "Тип коробки передач", "Назначение", "Упаковка", "Класс ACEA",
+        "Допуски", "Тип двигателя", "article_sku", "rating",
+        "reviews_count", "seller_count",
+    ],
+    "filters": [
+        "product_id", "name", "price", "url", "slug", "category", "brand",
+        "images", "quantity_available", "filter_type",
+        "manufacturer_article", "compatible_brand", "compatible_model",
+        "compatible_years", "oem_numbers", "additional_information",
+        "article_sku", "rating", "reviews_count", "seller_count",
+    ],
+    "batteries": [
+        "product_id", "name", "price", "url", "slug", "category", "brand",
+        "images", "quantity_available", "capacity_ah", "voltage_v",
+        "start_current_a", "polarity", "battery_type", "dimensions",
+        "terminal_type", "case_type", "weight", "features", "length",
+        "width", "height", "article_sku", "rating", "reviews_count",
+        "seller_count",
+    ],
+}
 
 KNOWN_BRANDS = [
     "castrol",
@@ -563,15 +599,23 @@ def normalize_numeric_text(value: str) -> str:
     return match.group(0).replace(",", ".") if match else value
 
 
-class ForteBrowserClient:
-    def __init__(self, *, headless: bool, slow_mo_ms: int, humanize: bool):
-        self.headless = headless
-        self.slow_mo_ms = slow_mo_ms
-        self.humanize = humanize
-        self.session = requests.Session()
+class ForteHttpClient:
+    def __init__(self, *, timeout: float = 60):
+        self.timeout = timeout
+        self._local = threading.local()
+        self._sessions: list[requests.Session] = []
+        self._sessions_lock = threading.Lock()
 
-    def __enter__(self) -> "ForteBrowserClient":
-        self.session.headers.update(
+    def __enter__(self) -> "ForteHttpClient":
+        self._session()
+        return self
+
+    def _session(self) -> requests.Session:
+        session = getattr(self._local, "session", None)
+        if session is not None:
+            return session
+        session = requests.Session()
+        session.headers.update(
             {
                 "User-Agent": (
                     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -584,10 +628,14 @@ class ForteBrowserClient:
                 "Referer": WEB_HOST + "/",
             }
         )
-        return self
+        self._local.session = session
+        with self._sessions_lock:
+            self._sessions.append(session)
+        return session
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        self.session.close()
+        for session in self._sessions:
+            session.close()
 
     def api_get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         return self._api("GET", path, None, params)
@@ -604,12 +652,12 @@ class ForteBrowserClient:
     ) -> Any:
         url = API_HOST + path
         try:
-            response = self.session.request(
+            response = self._session().request(
                 method,
                 url,
                 params=params,
                 json=payload,
-                timeout=60,
+                timeout=self.timeout,
             )
         except requests.RequestException as exc:
             raise ForteNetworkError(f"API {method} {path} request failed: {exc}") from exc
@@ -655,7 +703,7 @@ def register_category(
     return category_id
 
 
-def collect_categories(client: ForteBrowserClient, state: State, root_slug: str) -> str:
+def collect_categories(client: ForteHttpClient, state: State, root_slug: str) -> str:
     root = client.api_get(f"/api/v4/catalogs/fulldata/slug/{root_slug}", {"lite": "true"})
     category = root["category"]
     root_uid = category["uid"]
@@ -832,6 +880,8 @@ def ingest_product(
     old_price = product.get("old_product_price") or 0
     in_stock = bool(showcase.get("in_stock", product.get("in_stock", False)))
     normalized_description = clean_text(showcase.get("description") or showcase.get("short_description") or "")
+    rating = product.get("aggs_rating")
+    reviews_count = product.get("reviews_count")
 
     dimensions = showcase.get("dimensions") or {}
     flat_row = {
@@ -840,6 +890,7 @@ def ingest_product(
         "source_product_id": source_product_id,
         "source_uid": source_uid,
         "source_url": source_url,
+        "slug": showcase.get("slug") or product.get("slug") or "",
         "category_id": category_id,
         "category": category_name,
         "product_name": name,
@@ -852,6 +903,10 @@ def ingest_product(
         "city": city,
         "parsed_at": parsed_at,
         "image_urls": json.dumps(images, ensure_ascii=False),
+        "rating": rating if rating is not None else "",
+        "reviews_count": reviews_count if reviews_count is not None else "",
+        "seller_count": len(skus),
+        "weight": showcase.get("weight") or product.get("weight") or "",
     }
     for attr_name in allowed_attrs:
         flat_row[attr_name] = raw_attrs.get(attr_name, "")
@@ -863,7 +918,7 @@ def ingest_product(
     return True
 
 
-def fetch_detail(client: ForteBrowserClient, product: dict[str, Any], city: str) -> dict[str, Any] | None:
+def fetch_detail(client: ForteHttpClient, product: dict[str, Any], city: str) -> dict[str, Any] | None:
     slug = product.get("slug")
     uid = product.get("uid")
     candidates = []
@@ -880,7 +935,7 @@ def fetch_detail(client: ForteBrowserClient, product: dict[str, Any], city: str)
 
 
 def iter_products(
-    client: ForteBrowserClient,
+    client: ForteHttpClient,
     *,
     category_uid: str,
     city: str,
@@ -924,6 +979,11 @@ def iter_products(
         if data is None:
             break
         products = data.get("products") or []
+        total = data.get("total_hits") or 0
+        print(
+            f"[forte] listing offset={offset}: получено={len(products)}, всего={total or 'неизвестно'}",
+            flush=True,
+        )
         if not products:
             break
         for product in products:
@@ -932,11 +992,16 @@ def iter_products(
             if max_products and fetched >= max_products:
                 return
         offset += len(products)
-        total = data.get("total_hits") or 0
         if total and offset >= total:
             break
         if sleep_s:
             time.sleep(sleep_s)
+
+
+def batched(iterable: Iterable[dict[str, Any]], size: int) -> Iterable[list[dict[str, Any]]]:
+    iterator = iter(iterable)
+    while batch := list(islice(iterator, size)):
+        yield batch
 
 
 def write_csv(path: Path, rows: Iterable[dict[str, Any]], fieldnames: list[str]) -> int:
@@ -951,32 +1016,96 @@ def write_csv(path: Path, rows: Iterable[dict[str, Any]], fieldnames: list[str])
     return count
 
 
-def flat_product_fieldnames() -> list[str]:
-    fields = [
-        "sku_id",
-        "source",
-        "source_product_id",
-        "source_uid",
-        "source_url",
-        "category_id",
-        "category",
-        "product_name",
-        "normalized_name",
-        "description",
-        "price",
-        "old_price",
-        "currency",
-        "availability",
-        "city",
-        "parsed_at",
-        "image_urls",
-    ]
-    attrs: list[str] = []
-    for rule in CORE_AUTO_CATEGORY_RULES.values():
-        for attr_name in rule["attributes"]:
-            if attr_name not in attrs:
-                attrs.append(attr_name)
-    return fields + attrs
+def output_row(row: dict[str, Any], group: str) -> dict[str, Any]:
+    images = row.get("image_urls", "")
+    try:
+        images = " | ".join(json.loads(images)) if images else ""
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+
+    common = {
+        "product_id": row.get("source_product_id", ""),
+        "name": row.get("product_name", ""),
+        "price": row.get("price", ""),
+        "url": row.get("source_url", ""),
+        "slug": row.get("slug", ""),
+        "category": row.get("category", ""),
+        "images": images,
+        "brand": row.get("brand", ""),
+        "brand_name": row.get("brand", ""),
+        "quantity_available": "",
+        "article_sku": row.get("source_product_id", ""),
+        "rating": row.get("rating", ""),
+        "reviews_count": row.get("reviews_count", ""),
+        "seller_count": row.get("seller_count", ""),
+        "weight": row.get("weight", ""),
+    }
+    if group == "tires":
+        width = row.get("width", "")
+        height = row.get("profile", "")
+        diameter = str(row.get("diameter", "")).lstrip("Rr")
+        common.update(
+            {
+                "season": row.get("season", ""),
+                "size": f"{width}/{height} R{diameter}" if width and height and diameter else "",
+                "width": width,
+                "height": height,
+                "diameter": diameter,
+                "weight_single_index": row.get("load_index", ""),
+                "weight_double_index": "",
+                "velocity_index": row.get("speed_index", ""),
+                "tyre_auto_type_name": "",
+                "tyre_stud_type_name": "",
+                "is_ecar": "",
+                "model_name": row.get("product_line", ""),
+            }
+        )
+    elif group == "oils":
+        common.update(
+            {
+                "Вид масла": row.get("oil_type", ""),
+                "Класс API": row.get("specification", ""),
+                "Класс вязкости SAE": row.get("viscosity", ""),
+                "Объем упаковки, л": row.get("volume_liters", ""),
+                "Область применения": row.get("engine_type", ""),
+                "Тип коробки передач": "",
+                "Назначение": "",
+                "Упаковка": row.get("package_type", ""),
+                "Класс ACEA": "",
+                "Допуски": "",
+                "Тип двигателя": row.get("engine_type", ""),
+            }
+        )
+    elif group == "filters":
+        common.update(
+            {
+                "filter_type": row.get("filter_type", ""),
+                "manufacturer_article": "",
+                "compatible_brand": row.get("compatible_brand", ""),
+                "compatible_model": row.get("compatible_model", ""),
+                "compatible_years": "",
+                "oem_numbers": row.get("oem_number", ""),
+                "additional_information": row.get("description", ""),
+            }
+        )
+    elif group == "batteries":
+        common.update(
+            {
+                "capacity_ah": row.get("capacity_ah", ""),
+                "voltage_v": row.get("voltage_v", ""),
+                "start_current_a": row.get("start_current_a", ""),
+                "polarity": row.get("polarity", ""),
+                "battery_type": row.get("battery_type", ""),
+                "dimensions": row.get("dimensions", ""),
+                "terminal_type": row.get("terminal_type", ""),
+                "case_type": "",
+                "features": row.get("description", ""),
+                "length": "",
+                "width": "",
+                "height": "",
+            }
+        )
+    return common
 
 
 def write_outputs(
@@ -990,11 +1119,15 @@ def write_outputs(
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    write_csv(
-        out_dir / "forte_products.csv",
-        state.flat_products,
-        flat_product_fieldnames(),
-    )
+    output_counts: dict[str, int] = {}
+    for category_id, rule in CORE_AUTO_CATEGORY_RULES.items():
+        output_key = "oils" if rule["key"] == "motor_oils" else rule["key"]
+        rows = [row for row in state.flat_products if row.get("category_id") == category_id]
+        output_counts[output_key] = write_csv(
+            out_dir / f"forte_{output_key}.csv",
+            (output_row(row, output_key) for row in rows),
+            GROUP_OUTPUT_COLUMNS[output_key],
+        )
 
     summary = {
         "source": SOURCE,
@@ -1004,6 +1137,7 @@ def write_outputs(
         "categories": len(state.categories),
         "unique_source_products": len(state.seen_source_products),
         "flat_products": len(state.flat_products),
+        "output_counts": output_counts,
         "completed": completed,
         "error": error,
     }
@@ -1019,13 +1153,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--city", default="KZ", help="ForteMarket city code, e.g. KZ, KZ-ALA, KZ-AST.")
     parser.add_argument("--page-size", type=int, default=50)
-    parser.add_argument("--max-products", type=int, default=100, help="0 means unlimited.")
-    parser.add_argument("--max-products-per-category", type=int, default=0, help="0 means use --max-products as total limit.")
+    parser.add_argument(
+        "--max-products",
+        type=int,
+        default=0,
+        help="Общий лимит товаров. 0 означает без общего лимита.",
+    )
+    parser.add_argument(
+        "--max-products-per-category",
+        type=int,
+        default=0,
+        help="Одинаковый лимит для каждой категории. 0 означает без лимита.",
+    )
+    parser.add_argument("--limit-tires", type=int, default=0, help="Лимит строк в forte_tires.csv.")
+    parser.add_argument("--limit-oils", type=int, default=0, help="Лимит строк в forte_oils.csv.")
+    parser.add_argument("--limit-filters", type=int, default=0, help="Лимит строк в forte_filters.csv.")
+    parser.add_argument("--limit-batteries", type=int, default=0, help="Лимит строк в forte_batteries.csv.")
     parser.add_argument("--start-offset", type=int, default=0, help="Start offset inside each requested category.")
     parser.add_argument("--output-dir", default="data/forte_market")
-    parser.add_argument("--headful", action="store_true", help="Ignored; kept for backward-compatible CLI.")
-    parser.add_argument("--humanize", action="store_true", help="Ignored; kept for backward-compatible CLI.")
-    parser.add_argument("--slow-mo-ms", type=int, default=0)
+    parser.add_argument("--timeout", type=float, default=60, help="HTTP timeout in seconds.")
+    parser.add_argument("--workers", type=int, default=6, help="Parallel detail requests.")
     parser.add_argument("--sleep", type=float, default=0.25, help="Pause between listing pages.")
     parser.add_argument("--retries", type=int, default=5, help="Retries for transient API errors.")
     parser.add_argument("--retry-sleep", type=float, default=5.0, help="Initial retry sleep in seconds.")
@@ -1043,13 +1190,22 @@ def main() -> int:
     raw_count = 0
     completed = False
     error_message = ""
+    category_limits = {
+        "tires": args.limit_tires,
+        "oils": args.limit_oils,
+        "filters": args.limit_filters,
+        "batteries": args.limit_batteries,
+    }
 
     try:
-        with ForteBrowserClient(
-            headless=not args.headful,
-            slow_mo_ms=args.slow_mo_ms,
-            humanize=args.humanize,
-        ) as client:
+        print(
+            "[forte] Старт: прямые HTTP-запросы, "
+            f"page_size={args.page_size}, workers={args.workers}, "
+            f"details={'нет' if args.skip_details else 'да'}",
+            flush=True,
+        )
+        with ForteHttpClient(timeout=args.timeout) as client:
+            print(f"[forte] Получаю дерево категорий: {args.category_slug}", flush=True)
             category_uid = collect_categories(client, state, args.category_slug)
             category_targets = [category_uid]
             leaves = leaf_category_uids(state, category_uid)
@@ -1064,7 +1220,7 @@ def main() -> int:
                 state.categories.get(str(state.category_uid_to_int.get(uid)), {}).get("name", uid)
                 for uid in category_targets
             )
-            print(f"parsing target categories only: {target_names}", file=sys.stderr)
+            print(f"[forte] Найдены категории: {target_names}", flush=True)
             if not category_targets:
                 raise RuntimeError(
                     "No target categories found. Expected motor oils, batteries, tires, and auto filters under "
@@ -1072,56 +1228,81 @@ def main() -> int:
                 )
             keep_only_target_categories(state, category_targets)
             out_dir.mkdir(parents=True, exist_ok=True)
-            with raw_path.open("w", encoding="utf-8") as raw_file:
+            with raw_path.open("w", encoding="utf-8") as raw_file, ThreadPoolExecutor(
+                max_workers=max(1, args.workers)
+            ) as executor:
                 for idx, target_uid in enumerate(category_targets, start=1):
-                    category_name = state.categories.get(str(state.category_uid_to_int.get(target_uid, "")), {}).get(
-                        "name", target_uid
+                    category_id = state.category_uid_to_int.get(target_uid, 0)
+                    category_name = state.categories.get(str(category_id), {}).get("name", target_uid)
+                    category_rule = CORE_AUTO_CATEGORY_RULES[category_id]
+                    category_key = "oils" if category_rule["key"] == "motor_oils" else category_rule["key"]
+                    category_limit = (
+                        category_limits[category_key]
+                        or args.max_products_per_category
+                        or (args.max_products - raw_count if args.max_products else 0)
                     )
-                    if len(category_targets) > 1:
-                        print(f"category {idx}/{len(category_targets)}: {category_name}", file=sys.stderr)
-                    for product in iter_products(
+                    category_count = 0
+                    print(
+                        f"[forte] [{idx}/{len(category_targets)}] {category_name}: "
+                        f"лимит={category_limit or 'без лимита'}",
+                        flush=True,
+                    )
+                    products = iter_products(
                         client,
                         category_uid=target_uid,
                         city=args.city,
                         page_size=args.page_size,
-                        max_products=(
-                            args.max_products_per_category
-                            if args.max_products_per_category
-                            else args.max_products - raw_count
-                            if args.max_products
-                            else 0
-                        ),
+                        max_products=category_limit,
                         sleep_s=args.sleep,
                         start_offset=args.start_offset,
                         retries=args.retries,
                         retry_sleep=args.retry_sleep,
-                    ):
-                        source_key = str(product.get("uid") or product.get("short_id") or product.get("slug"))
-                        if source_key in state.seen_source_products:
-                            continue
-                        state.seen_source_products.add(source_key)
-
-                        detail = None if args.skip_details else fetch_detail(client, product, args.city)
-                        parsed_at = now_utc()
-                        raw_file.write(
-                            json.dumps(
-                                {
-                                    "category_uid": target_uid,
-                                    "product": product,
-                                    "detail": detail,
-                                    "parsed_at": parsed_at,
-                                },
-                                ensure_ascii=False,
+                    )
+                    for product_batch in batched(products, max(1, args.workers * 2)):
+                        if args.skip_details:
+                            details = [None] * len(product_batch)
+                        else:
+                            details = list(
+                                executor.map(
+                                    lambda product: fetch_detail(client, product, args.city),
+                                    product_batch,
+                                )
                             )
-                            + "\n"
-                        )
-                        if not ingest_product(state, product, detail, parsed_at, args.city):
-                            continue
-                        raw_count += 1
-                        if raw_count % 25 == 0:
-                            print(f"parsed {raw_count} products", file=sys.stderr)
+                        for product, detail in zip(product_batch, details):
+                            source_key = str(product.get("uid") or product.get("short_id") or product.get("slug"))
+                            if source_key in state.seen_source_products:
+                                continue
+                            state.seen_source_products.add(source_key)
+
+                            if detail is None and not args.skip_details:
+                                print(f"[forte] Детали не получены: {source_key}", file=sys.stderr, flush=True)
+                            parsed_at = now_utc()
+                            raw_file.write(
+                                json.dumps(
+                                    {
+                                        "category_uid": target_uid,
+                                        "product": product,
+                                        "detail": detail,
+                                        "parsed_at": parsed_at,
+                                    },
+                                    ensure_ascii=False,
+                                )
+                                + "\n"
+                            )
+                            if not ingest_product(state, product, detail, parsed_at, args.city):
+                                continue
+                            raw_count += 1
+                            category_count += 1
+                            if category_count % 25 == 0:
+                                print(
+                                    f"[forte] {category_name}: собрано={category_count}, всего={raw_count}",
+                                    flush=True,
+                                )
+                            if args.max_products and raw_count >= args.max_products:
+                                break
                         if args.max_products and raw_count >= args.max_products:
                             break
+                    print(f"[forte] {category_name}: готово, собрано={category_count}", flush=True)
                     if args.max_products and raw_count >= args.max_products:
                         break
             completed = True
@@ -1131,7 +1312,7 @@ def main() -> int:
     finally:
         finished_at = now_utc()
         write_outputs(out_dir, state, raw_count, started_at, finished_at, completed, error_message)
-        print(out_dir)
+        print(f"[forte] Результаты: {out_dir}", flush=True)
 
     return 0
 

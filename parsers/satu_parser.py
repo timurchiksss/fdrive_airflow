@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Parse Satu.kz auto products from the four target categories into one flat CSV.
+Parse Satu.kz auto products from four target categories.
 
-The scraper uses CloakBrowser for the browsing/session layer and reads Satu's
-server-rendered Apollo cache from listing and product pages.
+The parser uses direct HTTP requests, reads the server-rendered Apollo cache,
+and writes a separate CSV for tires, oils, filters, and batteries.
 """
 
 from __future__ import annotations
@@ -12,23 +12,17 @@ import argparse
 import csv
 import html
 import json
-import os
 import re
+import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from itertools import islice
 from pathlib import Path
 from typing import Any, Iterable
 
-try:
-    from cloakbrowser import launch
-except ImportError as exc:  # pragma: no cover - human-facing setup error
-    raise SystemExit(
-        "cloakbrowser is not installed. Run: python3 -m pip install -r requirements.txt"
-    ) from exc
+import requests
 
 
 SOURCE = "satu_kz"
@@ -48,6 +42,8 @@ CORE_AUTO_CATEGORY_RULES = {
             "engine_type",
             "specification",
             "package_type",
+            "acea_class",
+            "approvals",
         ],
     },
     "batteries": {
@@ -63,6 +59,11 @@ CORE_AUTO_CATEGORY_RULES = {
             "battery_type",
             "dimensions",
             "terminal_type",
+            "weight",
+            "features",
+            "length",
+            "width",
+            "height",
         ],
     },
     "tires": {
@@ -78,6 +79,8 @@ CORE_AUTO_CATEGORY_RULES = {
             "load_index",
             "speed_index",
             "runflat",
+            "model_name",
+            "weight",
         ],
     },
     "filters": {
@@ -90,6 +93,7 @@ CORE_AUTO_CATEGORY_RULES = {
             "compatible_brand",
             "compatible_model",
             "oem_number",
+            "additional_information",
         ],
     },
 }
@@ -98,6 +102,40 @@ CATEGORY_ID_TO_KEY = {
     category_id: key
     for key, rule in CORE_AUTO_CATEGORY_RULES.items()
     for category_id in rule["category_ids"]
+}
+
+GROUP_OUTPUT_COLUMNS = {
+    "tires": [
+        "product_id", "name", "price", "url", "slug", "images", "brand",
+        "season", "size", "width", "height", "diameter",
+        "weight_single_index", "weight_double_index", "velocity_index",
+        "quantity_available", "tyre_auto_type_name", "tyre_stud_type_name",
+        "is_ecar", "article_sku", "rating", "reviews_count", "seller_count",
+        "model_name", "weight",
+    ],
+    "oils": [
+        "product_id", "name", "price", "url", "slug", "category",
+        "brand_name", "images", "Вид масла", "Класс API",
+        "Класс вязкости SAE", "Объем упаковки, л", "Область применения",
+        "Тип коробки передач", "Назначение", "Упаковка", "Класс ACEA",
+        "Допуски", "Тип двигателя", "article_sku", "rating",
+        "reviews_count", "seller_count",
+    ],
+    "filters": [
+        "product_id", "name", "price", "url", "slug", "category", "brand",
+        "images", "quantity_available", "filter_type",
+        "manufacturer_article", "compatible_brand", "compatible_model",
+        "compatible_years", "oem_numbers", "additional_information",
+        "article_sku", "rating", "reviews_count", "seller_count",
+    ],
+    "batteries": [
+        "product_id", "name", "price", "url", "slug", "category", "brand",
+        "images", "quantity_available", "capacity_ah", "voltage_v",
+        "start_current_a", "polarity", "battery_type", "dimensions",
+        "terminal_type", "case_type", "weight", "features", "length",
+        "width", "height", "article_sku", "rating", "reviews_count",
+        "seller_count",
+    ],
 }
 
 KNOWN_BRANDS = [
@@ -152,9 +190,10 @@ ATTRIBUTE_ALIASES = {
     "для типа двигателей": "engine_type",
     "тип двигателя": "engine_type",
     "стандарт api": "specification",
-    "стандарт acea": "specification",
-    "допуск": "specification",
-    "допуски": "specification",
+    "стандарт acea": "acea_class",
+    "класс acea": "acea_class",
+    "допуск": "approvals",
+    "допуски": "approvals",
     "тип упаковки": "package_type",
     "упаковка": "package_type",
     "емкость аккумулятора": "capacity_ah",
@@ -174,10 +213,12 @@ ATTRIBUTE_ALIASES = {
     "высота профиля": "profile",
     "профиль": "profile",
     "посадочный диаметр": "diameter",
+    "посадочный диаметр шины": "diameter",
     "диаметр": "diameter",
     "сезонность шин": "season",
     "сезон": "season",
     "индекс нагрузки": "load_index",
+    "индекс нагрузки шины": "load_index",
     "индекс скорости": "speed_index",
     "runflat": "runflat",
     "run flat": "runflat",
@@ -192,6 +233,13 @@ ATTRIBUTE_ALIASES = {
     "совместимая марка": "compatible_brand",
     "модель автомобиля": "compatible_model",
     "совместимая модель": "compatible_model",
+    "вес": "weight",
+    "вес, кг": "weight",
+    "особенности": "features",
+    "длина": "length",
+    "высота": "height",
+    "модель": "model_name",
+    "дополнительная информация": "additional_information",
 }
 
 RE_AD_WORDS = re.compile(
@@ -252,55 +300,48 @@ class SatuParseError(RuntimeError):
     pass
 
 
-class SatuBrowserClient:
-    def __init__(self, *, headless: bool, slow_mo_ms: int, humanize: bool, direct_http: bool):
-        self.headless = headless
-        self.slow_mo_ms = slow_mo_ms
-        self.humanize = humanize
-        self.direct_http = direct_http
-        self.browser = None
-        self.page = None
+class SatuHttpClient:
+    def __init__(self, *, timeout: float = 60):
+        self.timeout = timeout
+        self._local = threading.local()
+        self._sessions: list[requests.Session] = []
+        self._sessions_lock = threading.Lock()
 
-    def __enter__(self) -> "SatuBrowserClient":
-        if self.direct_http:
-            return self
-        os.environ.setdefault("CLOAKBROWSER_CACHE_DIR", str((Path.cwd() / ".cloakbrowser").resolve()))
-        kwargs: dict[str, Any] = {
-            "headless": self.headless,
-            "humanize": self.humanize,
-            "args": ["--disable-blink-features=AutomationControlled"],
-        }
-        if self.slow_mo_ms:
-            kwargs["slow_mo"] = self.slow_mo_ms
-        self.browser = launch(**kwargs)
-        self.page = self.browser.new_page()
-        self.page.set_default_timeout(45_000)
+    def __enter__(self) -> "SatuHttpClient":
+        self._session()
         return self
 
+    def _session(self) -> requests.Session:
+        session = getattr(self._local, "session", None)
+        if session is not None:
+            return session
+        session = requests.Session()
+        session.headers.update(
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+            }
+        )
+        self._local.session = session
+        with self._sessions_lock:
+            self._sessions.append(session)
+        return session
+
     def __exit__(self, exc_type, exc, tb) -> None:
-        if self.browser:
-            self.browser.close()
+        for session in self._sessions:
+            session.close()
 
     def fetch_text(self, url: str) -> str:
-        if self.direct_http:
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-                },
-            )
-            with urllib.request.urlopen(req, timeout=60) as response:
-                return response.read().decode("utf-8", errors="replace")
-
-        assert self.page is not None
-        response = self.page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-        status = response.status if response else 0
-        if status >= 400:
-            raise SatuParseError(f"GET {url} failed with {status}")
-        return self.page.content()
+        try:
+            response = self._session().get(url, timeout=self.timeout)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise SatuParseError(f"GET {url} failed: {exc}") from exc
+        return response.text
 
 
 def clean_text(value: Any) -> str:
@@ -315,6 +356,8 @@ def clean_text(value: Any) -> str:
 
 def normalize_attr_name(title: str) -> str:
     key = clean_text(title).lower().replace("ё", "е")
+    if key.startswith(("допуск ", "допуски ")):
+        return "approvals"
     key = ATTRIBUTE_ALIASES.get(key, key)
     key = re.sub(r"[^0-9a-zа-я_]+", "_", key, flags=re.IGNORECASE)
     return key.strip("_").lower() or "unknown_attribute"
@@ -654,8 +697,9 @@ def build_flat_product(
     name = clean_text(product.get("name") or product.get("nameForCatalog") or listing_product.get("name"))
     if not name:
         name = clean_text(listing_product.get("name"))
+    description = clean_text(product.get("descriptionPlain") or product.get("descriptionFull"))[:2000]
 
-    attrs = extract_derived_attrs(name)
+    attrs = extract_derived_attrs(f"{name} {description}")
     dimension_parts: dict[str, str] = {}
     for attr in product.get("attributes") or []:
         raw_attr_name = clean_text(attr.get("name", ""))
@@ -665,7 +709,7 @@ def build_flat_product(
             raw_key = raw_attr_name.lower().replace("ё", "е")
             if raw_key in {"длина", "ширина", "высота"}:
                 dimension_parts[raw_key] = normalize_numeric_text(value)
-                continue
+                merge_attr(attrs, {"длина": "length", "ширина": "width", "высота": "height"}[raw_key], value)
         if attr_name == "specification":
             merge_attr(attrs, attr_name, value)
         elif attr_name in flat_attribute_names():
@@ -683,6 +727,18 @@ def build_flat_product(
         for key, value in infer_filter_compatibility(name).items():
             merge_attr(attrs, key, value)
     if category_key == "batteries":
+        dimensions_match = re.search(
+            r"\b(?P<length>\d{2,3})\s*[xх×]\s*(?P<width>\d{2,3})\s*[xх×]\s*(?P<height>\d{2,3})\b",
+            f"{name} {description}",
+            flags=re.IGNORECASE,
+        )
+        if dimensions_match:
+            for key in ("length", "width", "height"):
+                attrs.setdefault(key, dimensions_match.group(key))
+            attrs.setdefault(
+                "dimensions",
+                "x".join(dimensions_match.group(key) for key in ("length", "width", "height")),
+            )
         if dimension_parts and not attrs.get("dimensions"):
             length = dimension_parts.get("длина", "")
             width = dimension_parts.get("ширина", "")
@@ -696,6 +752,16 @@ def build_flat_product(
                 attrs["battery_type"] = battery_type
     if category_key == "motor_oils" and attrs.get("volume_liters") and not attrs.get("package_type"):
         attrs["package_type"] = "bottle"
+    if category_key == "tires" and not attrs.get("model_name"):
+        model = product.get("model") or listing_product.get("model")
+        if isinstance(model, dict):
+            model = model.get("name") or model.get("title")
+        if model:
+            attrs["model_name"] = clean_text(model)
+    if category_key == "filters" and description and not attrs.get("additional_information"):
+        attrs["additional_information"] = description
+    if category_key == "batteries" and description and not attrs.get("features"):
+        attrs["features"] = description
 
     allowed = set(CORE_AUTO_CATEGORY_RULES[category_key]["attributes"])
     attrs = {key: value for key, value in attrs.items() if key in allowed}
@@ -708,6 +774,9 @@ def build_flat_product(
     if not source_product_id:
         match = RE_PRODUCT_URL.search(source_url)
         source_product_id = match.group("id") if match else source_url
+    opinion_counters = product.get("productOpinionCounters") or listing_product.get("productOpinionCounters") or {}
+    company = product.get("company") or listing_product.get("company") or {}
+    article_sku = product.get("sku") or listing_product.get("sku") or source_product_id
 
     row = {
         "sku_id": f"{SOURCE}:{source_product_id}",
@@ -715,11 +784,12 @@ def build_flat_product(
         "source_product_id": source_product_id,
         "source_uid": source_product_id,
         "source_url": source_url,
+        "slug": product.get("urlText") or listing_product.get("urlText") or "",
         "category_id": category_id,
         "category": category_name,
         "product_name": name,
         "normalized_name": normalize_product_name(name, attrs),
-        "description": clean_text(product.get("descriptionPlain") or product.get("descriptionFull"))[:2000],
+        "description": description,
         "price": product.get("price") or listing_product.get("price") or "",
         "old_price": product.get("priceOriginal") or listing_product.get("priceOriginal") or "",
         "currency": product.get("priceCurrency") or listing_product.get("priceCurrency") or "KZT",
@@ -729,8 +799,13 @@ def build_flat_product(
         or ((listing_product.get("company") or {}).get("regionName") if isinstance(listing_product.get("company"), dict) else ""),
         "parsed_at": parsed_at,
         "image_urls": collect_images(product) or collect_images(listing_product),
+        "article_sku": article_sku,
+        "rating": opinion_counters.get("rating") if opinion_counters.get("rating") is not None else "",
+        "reviews_count": opinion_counters.get("count") if opinion_counters.get("count") is not None else "",
+        "seller_count": 1 if isinstance(company, dict) and company.get("id") else "",
     }
     row.update(attrs)
+    row["_category_key"] = category_key
     return row
 
 
@@ -742,7 +817,7 @@ def category_url(alias: str, page: int) -> str:
 
 
 def iter_listing_products(
-    client: SatuBrowserClient,
+    client: SatuHttpClient,
     *,
     category_key: str,
     page_size_hint: int,
@@ -759,13 +834,17 @@ def iter_listing_products(
             try:
                 page_html = client.fetch_text(url)
                 break
-            except (SatuParseError, urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
+            except (SatuParseError, TimeoutError) as exc:
                 if attempt >= retries:
                     raise SatuParseError(f"GET listing {url} failed after {retries} attempts: {exc}") from exc
                 time.sleep(retry_sleep * attempt)
         cache = extract_apollo_state(page_html)
         page = find_listing_page(cache)
         products = page.get("products") or []
+        print(
+            f"[satu] {rule['name']}, страница={page_number}: получено={len(products)}",
+            flush=True,
+        )
         if not products:
             break
         yielded = 0
@@ -786,7 +865,7 @@ def iter_listing_products(
 
 
 def enrich_detail(
-    client: SatuBrowserClient,
+    client: SatuHttpClient,
     listing_product: dict[str, Any],
     *,
     retries: int,
@@ -799,7 +878,7 @@ def enrich_detail(
             page_html = client.fetch_text(url)
             cache = extract_apollo_state(page_html)
             return find_product_detail(cache, source_product_id), cache, ""
-        except (SatuParseError, urllib.error.URLError, TimeoutError) as exc:
+        except (SatuParseError, TimeoutError) as exc:
             if attempt >= retries:
                 return None, None, str(exc)
             time.sleep(retry_sleep * attempt)
@@ -815,26 +894,102 @@ def flat_attribute_names() -> list[str]:
     return attrs
 
 
-def flat_product_fieldnames() -> list[str]:
-    return [
-        "sku_id",
-        "source",
-        "source_product_id",
-        "source_uid",
-        "source_url",
-        "category_id",
-        "category",
-        "product_name",
-        "normalized_name",
-        "description",
-        "price",
-        "old_price",
-        "currency",
-        "availability",
-        "city",
-        "parsed_at",
-        "image_urls",
-    ] + flat_attribute_names()
+def output_row(row: dict[str, Any], group: str) -> dict[str, Any]:
+    images = row.get("image_urls", "")
+    try:
+        images = " | ".join(json.loads(images)) if images else ""
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+
+    common = {
+        "product_id": row.get("source_product_id", ""),
+        "name": row.get("product_name", ""),
+        "price": row.get("price", ""),
+        "url": row.get("source_url", ""),
+        "slug": row.get("slug", ""),
+        "category": row.get("category", ""),
+        "images": images,
+        "brand": row.get("brand", ""),
+        "brand_name": row.get("brand", ""),
+        "quantity_available": "",
+        "article_sku": row.get("article_sku", ""),
+        "rating": row.get("rating", ""),
+        "reviews_count": row.get("reviews_count", ""),
+        "seller_count": row.get("seller_count", ""),
+        "weight": row.get("weight", ""),
+    }
+    if group == "tires":
+        width = row.get("width", "")
+        height = row.get("profile", "")
+        diameter = str(row.get("diameter", "")).lstrip("Rr")
+        common.update(
+            {
+                "season": row.get("season", ""),
+                "size": f"{width}/{height} R{diameter}" if width and height and diameter else "",
+                "width": width,
+                "height": height,
+                "diameter": diameter,
+                "weight_single_index": row.get("load_index", ""),
+                "weight_double_index": "",
+                "velocity_index": row.get("speed_index", ""),
+                "tyre_auto_type_name": "",
+                "tyre_stud_type_name": "",
+                "is_ecar": "",
+                "model_name": row.get("model_name", ""),
+            }
+        )
+    elif group == "oils":
+        common.update(
+            {
+                "Вид масла": row.get("oil_type", ""),
+                "Класс API": row.get("specification", ""),
+                "Класс вязкости SAE": row.get("viscosity", ""),
+                "Объем упаковки, л": row.get("volume_liters", ""),
+                "Область применения": row.get("engine_type", ""),
+                "Тип коробки передач": "",
+                "Назначение": "",
+                "Упаковка": row.get("package_type", ""),
+                "Класс ACEA": row.get("acea_class", ""),
+                "Допуски": row.get("approvals", ""),
+                "Тип двигателя": row.get("engine_type", ""),
+            }
+        )
+    elif group == "filters":
+        common.update(
+            {
+                "filter_type": row.get("filter_type", ""),
+                "manufacturer_article": "",
+                "compatible_brand": row.get("compatible_brand", ""),
+                "compatible_model": row.get("compatible_model", ""),
+                "compatible_years": "",
+                "oem_numbers": row.get("oem_number", ""),
+                "additional_information": row.get("additional_information", ""),
+            }
+        )
+    elif group == "batteries":
+        common.update(
+            {
+                "capacity_ah": row.get("capacity_ah", ""),
+                "voltage_v": row.get("voltage_v", ""),
+                "start_current_a": row.get("start_current_a", ""),
+                "polarity": row.get("polarity", ""),
+                "battery_type": row.get("battery_type", ""),
+                "dimensions": row.get("dimensions", ""),
+                "terminal_type": row.get("terminal_type", ""),
+                "case_type": "",
+                "features": row.get("features", ""),
+                "length": row.get("length", ""),
+                "width": row.get("width", ""),
+                "height": row.get("height", ""),
+            }
+        )
+    return common
+
+
+def batched(iterable: Iterable[dict[str, Any]], size: int) -> Iterable[list[dict[str, Any]]]:
+    iterator = iter(iterable)
+    while batch := list(islice(iterator, size)):
+        yield batch
 
 
 def write_csv(path: Path, rows: Iterable[dict[str, Any]], fieldnames: list[str]) -> int:
@@ -860,7 +1015,15 @@ def write_outputs(
     detail_errors: int,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    write_csv(out_dir / "satu_products.csv", state.flat_products, flat_product_fieldnames())
+    output_counts: dict[str, int] = {}
+    for category_key in CORE_AUTO_CATEGORY_RULES:
+        output_key = "oils" if category_key == "motor_oils" else category_key
+        rows = [row for row in state.flat_products if row.get("_category_key") == category_key]
+        output_counts[output_key] = write_csv(
+            out_dir / f"satu_{output_key}.csv",
+            (output_row(row, output_key) for row in rows),
+            GROUP_OUTPUT_COLUMNS[output_key],
+        )
     summary = {
         "source": SOURCE,
         "started_at": started_at,
@@ -869,6 +1032,7 @@ def write_outputs(
         "unique_source_products": len(state.seen_source_products),
         "flat_products": len(state.flat_products),
         "detail_errors": detail_errors,
+        "output_counts": output_counts,
         "completed": completed,
         "error": error,
         "categories": {key: rule["name"] for key, rule in CORE_AUTO_CATEGORY_RULES.items()},
@@ -883,24 +1047,26 @@ def parse_args() -> argparse.Namespace:
         default="motor_oils,batteries,tires,filters",
         help="Comma-separated keys: motor_oils,batteries,tires,filters.",
     )
-    parser.add_argument("--max-products", type=int, default=100, help="0 means unlimited.")
-    parser.add_argument("--max-products-per-category", type=int, default=0, help="0 means use --max-products as total limit.")
+    parser.add_argument("--max-products", type=int, default=0, help="Общий лимит. 0 означает без лимита.")
+    parser.add_argument(
+        "--max-products-per-category",
+        type=int,
+        default=0,
+        help="Одинаковый лимит каждой категории. 0 означает без лимита.",
+    )
+    parser.add_argument("--limit-tires", type=int, default=0, help="Лимит строк в satu_tires.csv.")
+    parser.add_argument("--limit-oils", type=int, default=0, help="Лимит строк в satu_oils.csv.")
+    parser.add_argument("--limit-filters", type=int, default=0, help="Лимит строк в satu_filters.csv.")
+    parser.add_argument("--limit-batteries", type=int, default=0, help="Лимит строк в satu_batteries.csv.")
     parser.add_argument("--max-pages", type=int, default=3, help="Maximum listing pages per category.")
     parser.add_argument("--page-size", type=int, default=48, help="Expected Satu listing page size.")
     parser.add_argument("--output-dir", default="data/satu")
-    parser.add_argument("--headful", action="store_true", help="Show browser window.")
-    parser.add_argument("--humanize", action="store_true", help="Enable CloakBrowser human-like input patches.")
-    parser.add_argument("--slow-mo-ms", type=int, default=0)
-    parser.add_argument("--sleep", type=float, default=0.5, help="Pause between listing/detail requests.")
+    parser.add_argument("--workers", type=int, default=6, help="Parallel detail requests.")
+    parser.add_argument("--timeout", type=float, default=60, help="HTTP timeout in seconds.")
+    parser.add_argument("--sleep", type=float, default=0.25, help="Pause between listing pages.")
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--retry-sleep", type=float, default=2.0)
     parser.add_argument("--skip-details", action="store_true", help="Only parse listing data; faster but fewer attrs.")
-    parser.add_argument(
-        "--direct-http",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use direct HTTP instead of CloakBrowser. Enabled by default for Airflow stability.",
-    )
     return parser.parse_args()
 
 
@@ -923,17 +1089,36 @@ def main() -> int:
     completed = False
     error_message = ""
     raw_path = out_dir / "raw_products.jsonl"
+    category_limits = {
+        "tires": args.limit_tires,
+        "motor_oils": args.limit_oils,
+        "filters": args.limit_filters,
+        "batteries": args.limit_batteries,
+    }
 
     try:
-        with SatuBrowserClient(
-            headless=not args.headful,
-            slow_mo_ms=args.slow_mo_ms,
-            humanize=args.humanize,
-            direct_http=args.direct_http,
-        ) as client, raw_path.open("w", encoding="utf-8") as raw_file:
-            for category_key in requested_categories:
+        print(
+            "[satu] Старт: прямые HTTP-запросы, "
+            f"workers={args.workers}, details={'нет' if args.skip_details else 'да'}",
+            flush=True,
+        )
+        with SatuHttpClient(timeout=args.timeout) as client, raw_path.open(
+            "w", encoding="utf-8"
+        ) as raw_file, ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
+            for category_index, category_key in enumerate(requested_categories, start=1):
                 category_flat_count = 0
-                for listing_product in iter_listing_products(
+                category_limit = (
+                    category_limits[category_key]
+                    or args.max_products_per_category
+                    or (args.max_products - len(state.flat_products) if args.max_products else 0)
+                )
+                category_name = CORE_AUTO_CATEGORY_RULES[category_key]["name"]
+                print(
+                    f"[satu] [{category_index}/{len(requested_categories)}] {category_name}: "
+                    f"лимит={category_limit or 'без лимита'}",
+                    flush=True,
+                )
+                listing_products = iter_listing_products(
                     client,
                     category_key=category_key,
                     page_size_hint=args.page_size,
@@ -941,54 +1126,73 @@ def main() -> int:
                     sleep_seconds=args.sleep,
                     retries=args.retries,
                     retry_sleep=args.retry_sleep,
-                ):
-                    source_product_id = str(listing_product.get("id") or "")
-                    if not source_product_id or source_product_id in state.seen_source_products:
-                        continue
-                    state.seen_source_products.add(source_product_id)
-                    raw_count += 1
-                    raw_file.write(json.dumps({"category_key": category_key, "listing": listing_product}, ensure_ascii=False) + "\n")
-
-                    detail_product = None
-                    detail_cache = None
-                    if not args.skip_details:
-                        detail_product, detail_cache, detail_error = enrich_detail(
-                            client,
-                            listing_product,
-                            retries=args.retries,
-                            retry_sleep=args.retry_sleep,
+                )
+                if category_limit:
+                    listing_products = islice(listing_products, category_limit)
+                for product_batch in batched(listing_products, max(1, args.workers * 2)):
+                    if args.skip_details:
+                        detail_results = [(None, None, "")] * len(product_batch)
+                    else:
+                        detail_results = list(
+                            executor.map(
+                                lambda product: enrich_detail(
+                                    client,
+                                    product,
+                                    retries=args.retries,
+                                    retry_sleep=args.retry_sleep,
+                                ),
+                                product_batch,
+                            )
+                        )
+                    for listing_product, detail_result in zip(product_batch, detail_results):
+                        source_product_id = str(listing_product.get("id") or "")
+                        if not source_product_id or source_product_id in state.seen_source_products:
+                            continue
+                        state.seen_source_products.add(source_product_id)
+                        raw_count += 1
+                        detail_product, detail_cache, detail_error = detail_result
+                        raw_file.write(
+                            json.dumps(
+                                {
+                                    "category_key": category_key,
+                                    "listing": listing_product,
+                                    "detail": detail_product,
+                                    "detail_error": detail_error,
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
                         )
                         if detail_error:
                             detail_errors += 1
-                            raw_file.write(
-                                json.dumps(
-                                    {
-                                        "category_key": category_key,
-                                        "source_product_id": source_product_id,
-                                        "detail_error": detail_error,
-                                    },
-                                    ensure_ascii=False,
-                                )
-                                + "\n"
+                            print(
+                                f"[satu] Детали не получены: {source_product_id}: {detail_error}",
+                                flush=True,
                             )
-                        time.sleep(args.sleep)
 
-                    row = build_flat_product(
-                        listing_product,
-                        detail_product,
-                        detail_cache,
-                        category_key,
-                        parsed_at=started_at,
-                    )
-                    state.flat_products.append(row)
-                    category_flat_count += 1
-                    if len(state.flat_products) % 25 == 0:
-                        print(f"parsed {len(state.flat_products)} products")
-                    if args.max_products_per_category and category_flat_count >= args.max_products_per_category:
-                        break
+                        state.flat_products.append(
+                            build_flat_product(
+                                listing_product,
+                                detail_product,
+                                detail_cache,
+                                category_key,
+                                parsed_at=started_at,
+                            )
+                        )
+                        category_flat_count += 1
+                        if category_flat_count % 25 == 0:
+                            print(
+                                f"[satu] {category_name}: собрано={category_flat_count}, "
+                                f"всего={len(state.flat_products)}",
+                                flush=True,
+                            )
+                        if args.max_products and len(state.flat_products) >= args.max_products:
+                            break
                     if args.max_products and len(state.flat_products) >= args.max_products:
-                        completed = True
-                        return 0
+                        break
+                print(f"[satu] {category_name}: готово, собрано={category_flat_count}", flush=True)
+                if args.max_products and len(state.flat_products) >= args.max_products:
+                    break
             completed = True
             return 0
     except KeyboardInterrupt:
@@ -1000,6 +1204,7 @@ def main() -> int:
     finally:
         finished_at = datetime.now(timezone.utc).isoformat()
         write_outputs(out_dir, state, raw_count, started_at, finished_at, completed, error_message, detail_errors)
+        print(f"[satu] Результаты: {out_dir}", flush=True)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,8 @@ x-airflow-common: &airflow-common
     RAW_PGUSER: ${RAW_PGUSER:-airflow}
     RAW_PGPASSWORD: ${RAW_PGPASSWORD:-airflow}
     RAW_PGDATABASE: ${RAW_PGDATABASE:-airflow}
+    MARKETPLACE_PGDATABASE: ${MARKETPLACE_PGDATABASE:-fdrive_marketplace_v2}
+    MARKETPLACE_MAINTENANCE_DATABASE: ${MARKETPLACE_MAINTENANCE_DATABASE:-postgres}
     RAW_SCHEMA: ${RAW_SCHEMA:-raw}
     CLEAN_SCHEMA: ${CLEAN_SCHEMA:-cleanned}
   volumes:

@@ -26,6 +26,10 @@ BASE_COLUMNS = [
     "city",
     "image_url",
     "parsed_at",
+    "article_sku",
+    "rating",
+    "reviews_count",
+    "seller_count",
 ]
 
 SCHEMAS = {
@@ -40,6 +44,7 @@ SCHEMAS = {
         "studded",
         "runflat",
         "model_name",
+        "weight",
     ],
     "oils": BASE_COLUMNS
     + [
@@ -50,6 +55,8 @@ SCHEMAS = {
         "specification",
         "product_line",
         "package_type",
+        "acea_class",
+        "approvals",
     ],
     "batteries": BASE_COLUMNS
     + [
@@ -60,6 +67,11 @@ SCHEMAS = {
         "battery_type",
         "dimensions",
         "terminal_type",
+        "weight",
+        "features",
+        "length",
+        "width",
+        "height",
     ],
     "filters": BASE_COLUMNS
     + [
@@ -67,6 +79,7 @@ SCHEMAS = {
         "compatible_brand",
         "compatible_model",
         "oem_number",
+        "additional_information",
     ],
     "wheels": BASE_COLUMNS
     + [
@@ -169,6 +182,10 @@ def base_row(row: dict[str, str], source: str, group: str) -> dict[str, str]:
         "city": pick(row, ["city"]) or "almaty",
         "image_url": first(pick(row, ["image_url", "image", "images", "image_urls"])),
         "parsed_at": pick(row, ["parsed_at", "updated_at", "created_at"]),
+        "article_sku": pick(row, ["article_sku", "sku", "code"]),
+        "rating": pick(row, ["rating"]),
+        "reviews_count": pick(row, ["reviews_count", "review_count"]),
+        "seller_count": pick(row, ["seller_count"]),
     }
 
 
@@ -198,6 +215,7 @@ def canonical_tire(row: dict[str, str], source: str) -> dict[str, str]:
             "studded": pick(row, ["studded", "tyre_stud_type_name", "Шипы"]),
             "runflat": pick(row, ["runflat", "Безопасная шина"]),
             "model_name": pick(row, ["model_name", "Модель", "Модель шины"]),
+            "weight": pick(row, ["weight", "Вес"]),
         }
     )
     return out
@@ -214,6 +232,8 @@ def canonical_oil(row: dict[str, str], source: str) -> dict[str, str]:
             "specification": pick(row, ["specification", "Класс API", "Стандарт API", "Стандарт DOT"]),
             "product_line": pick(row, ["product_line", "Специализация"]),
             "package_type": pick(row, ["package_type"]),
+            "acea_class": pick(row, ["acea_class", "Класс ACEA"]),
+            "approvals": pick(row, ["approvals", "Допуски", "Допуск"]),
         }
     )
     return out
@@ -230,6 +250,11 @@ def canonical_battery(row: dict[str, str], source: str) -> dict[str, str]:
             "battery_type": pick(row, ["battery_type"]),
             "dimensions": pick(row, ["dimensions"]),
             "terminal_type": pick(row, ["terminal_type"]),
+            "weight": pick(row, ["weight", "Вес"]),
+            "features": pick(row, ["features", "Особенности"]),
+            "length": pick(row, ["length", "Длина"]),
+            "width": pick(row, ["width", "Ширина"]),
+            "height": pick(row, ["height", "Высота"]),
         }
     )
     return out
@@ -243,6 +268,10 @@ def canonical_filter(row: dict[str, str], source: str) -> dict[str, str]:
             "compatible_brand": pick(row, ["compatible_brand"]),
             "compatible_model": pick(row, ["compatible_model"]),
             "oem_number": pick(row, ["oem_number", "oem_numbers"]),
+            "additional_information": pick(
+                row,
+                ["additional_information", "Дополнительная информация"],
+            ),
         }
     )
     return out
@@ -411,14 +440,21 @@ def normalize(data_dir: Path, max_rows: int = 15000, sources: set[str] | None = 
         add_category_file(outputs, data_dir / "shinline" / "wheels.csv", "shinline", "wheels")
 
     if wanted_source("satu", sources):
-        add_marketplace_file(outputs, data_dir / "satu_products.csv", "satu", max_rows_per_category=max_rows)
+        for group in ["tires", "oils", "batteries", "filters"]:
+            add_category_file(
+                outputs,
+                data_dir / "satu" / f"satu_{group}.csv",
+                "satu",
+                group,
+            )
     if wanted_source("forte_market", sources):
-        add_marketplace_file(
-            outputs,
-            data_dir / "forte_productsname_normalization.csv",
-            "forte_market",
-            max_rows_per_category=max_rows,
-        )
+        for group in ["tires", "oils", "batteries", "filters"]:
+            add_category_file(
+                outputs,
+                data_dir / "forte_market" / f"forte_{group}.csv",
+                "forte_market",
+                group,
+            )
 
     written = []
     for (source, group), rows in sorted(outputs.items()):

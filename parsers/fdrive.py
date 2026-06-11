@@ -142,13 +142,10 @@ def flatten_product(product: dict[str, Any], fallback_category: str) -> dict[str
         "url": product_url(product),
         "slug": product.get("slug") or "",
         "category": " | ".join(category_names) or fallback_category,
-        "brand_code": info.get("brand_code") or "",
-        "brand": info.get("brand") or "",
         "brand_name": info.get("brand_name") or "",
         "images": " | ".join(images(product)),
         "listing_page": product.get("_listing_page") or "",
         "listing_index": product.get("_listing_index") or "",
-        "is_duplicate": product.get("_is_duplicate") or "",
     }
 
     for key, value in attr_map(product).items():
@@ -176,14 +173,9 @@ def flatten_tyre(product: dict[str, Any]) -> dict[str, Any]:
         "product_id": product.get("id") or "",
         "name": product.get("name") or "",
         "price": product.get("price") or "",
-        "price_with_discount": product.get("priceWithDiscount") or "",
-        "price_without_discount": product.get("priceWithoutDiscount") or "",
         "url": f"{BASE_URL}/tyre/{product.get('slug')}" if product.get("slug") else "",
         "slug": product.get("slug") or "",
-        "category": product_type.get("title") or product_type_text or "Шины",
-        "product_type": product_type.get("name") or product_type_text or "",
         "brand": product.get("brand") or "",
-        "brand_slug": product.get("brandSlug") or "",
         "season": product.get("season") or "",
         "size": product.get("sizeStr") or "",
         "width": product.get("width") or "",
@@ -192,25 +184,13 @@ def flatten_tyre(product: dict[str, Any]) -> dict[str, Any]:
         "weight_single_index": product.get("weightSingleIndex") or "",
         "weight_double_index": product.get("weightDoubleIndex") or "",
         "velocity_index": product.get("velocityIndex") or "",
-        "manufacture_country": product.get("manufactureCountryCachedName") or "",
         "quantity_available": product.get("quantityAvailibleTotal") or "",
-        "quantity_available_text": product.get("quantityAvailibleTotalStr") or "",
-        "cashback": product.get("cashback") or "",
-        "tyre_auto_type_id": product.get("tyreAutoTypeId") or "",
         "tyre_auto_type_name": product.get("tyreAutoTypeName") or "",
-        "tyre_stud_type_id": tyre_stud_type.get("id") or "",
         "tyre_stud_type_name": tyre_stud_type.get("name") or "",
-        "rating": product.get("rating") or "",
-        "votes": product.get("votes") or "",
         "is_ecar": product.get("isEcar"),
-        "is_freedom_tyre": product.get("isFreedomTyre"),
-        "is_freedom_tyre_promotion": product.get("isFreedomTyrePromotion"),
-        "freedom_tyre_promotion_percent": product.get("freedomTyrePromotionPercent") or "",
-        "promotions": " | ".join(str(item) for item in promotions),
         "images": " | ".join(tyre_images(product)),
         "listing_page": product.get("_listing_page") or "",
         "listing_index": product.get("_listing_index") or "",
-        "is_duplicate": product.get("_is_duplicate") or "",
     }
 
 
@@ -233,13 +213,10 @@ def save_csv(rows: list[dict[str, Any]], path: Path) -> None:
         "url",
         "slug",
         "category",
-        "brand_code",
-        "brand",
         "brand_name",
         "images",
         "listing_page",
         "listing_index",
-        "is_duplicate",
     ]
     for col in preferred:
         if any(col in row for row in rows):
@@ -253,12 +230,6 @@ def save_csv(rows: list[dict[str, Any]], path: Path) -> None:
         writer = csv.DictWriter(file, fieldnames=columns)
         writer.writeheader()
         writer.writerows(rows)
-
-
-def save_jsonl(products: list[dict[str, Any]], path: Path) -> None:
-    with path.open("w", encoding="utf-8") as file:
-        for product in products:
-            file.write(json.dumps(product, ensure_ascii=False) + "\n")
 
 
 def scrape_category(
@@ -409,7 +380,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Скраппер товаров FDrive из Next.js JSON.")
     parser.add_argument("url", nargs="?", default=DEFAULT_URL, help="URL категории FDrive")
     parser.add_argument("--out", default="", help="Путь для CSV. По умолчанию имя строится из URL.")
-    parser.add_argument("--jsonl", default="", help="Путь для сырого JSONL. По умолчанию рядом с CSV.")
     parser.add_argument("--delay", type=float, default=0.5, help="Пауза между страницами в секундах.")
     parser.add_argument("--dedupe", action="store_true", help="Удалять повторы по productId/slug.")
     parser.add_argument("--max-pages", type=int, default=0, help="Ограничить число страниц для теста.")
@@ -417,7 +387,6 @@ def main() -> int:
     args = parser.parse_args()
 
     csv_path = Path(args.out or safe_output_name(args.url))
-    jsonl_path = Path(args.jsonl or csv_path.with_suffix(".jsonl"))
 
     if "/tyres/" in args.url:
         rows, raw_products = scrape_tyres(
@@ -439,11 +408,9 @@ def main() -> int:
         return 1
 
     save_csv(rows, csv_path)
-    save_jsonl(raw_products, jsonl_path)
 
     print(f"Готово: {len(rows)} товаров")
     print(f"CSV:   {csv_path.resolve()}")
-    print(f"JSONL: {jsonl_path.resolve()}")
     return 0
 
 

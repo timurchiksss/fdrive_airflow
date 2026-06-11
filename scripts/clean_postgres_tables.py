@@ -282,8 +282,13 @@ def append_table(cur, schema: str, table: str, df: pd.DataFrame) -> None:
     )
 
 
-def clean_database(raw_schema: str, clean_schema: str, tables: list[str] | None = None) -> None:
-    with connect(config_from_env()) as conn:
+def clean_database(
+    raw_schema: str,
+    clean_schema: str,
+    tables: list[str] | None = None,
+    config: PostgresConfig | None = None,
+) -> None:
+    with connect(config or config_from_env()) as conn:
         with conn.cursor() as cur:
             raw_tables = tables or list_tables(cur, raw_schema)
             print(f"raw schema: {raw_schema}")

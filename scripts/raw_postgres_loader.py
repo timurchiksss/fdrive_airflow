@@ -149,6 +149,27 @@ def connect(config: PostgresConfig):
     )
 
 
+def ensure_database_exists(config: PostgresConfig, maintenance_database: str = "postgres") -> None:
+    maintenance_config = PostgresConfig(
+        host=config.host,
+        port=config.port,
+        user=config.user,
+        password=config.password,
+        database=maintenance_database,
+    )
+    conn = connect(maintenance_config)
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (config.database,))
+            if cur.fetchone():
+                return
+            cur.execute(f"CREATE DATABASE {q_ident(config.database)}")
+            print(f"created database {config.database}", flush=True)
+    finally:
+        conn.close()
+
+
 def ensure_metadata(cur, schema: str) -> None:
     cur.execute(f"CREATE SCHEMA IF NOT EXISTS {q_ident(schema)}")
     cur.execute(
@@ -216,11 +237,15 @@ def ensure_table_columns(cur, schema: str, table: str, columns: list[tuple[str, 
             existing.add(column_name)
 
 
-def canonical_files(data_dir: Path) -> list[Path]:
+def canonical_files(data_dir: Path, tables: set[str] | None = None) -> list[Path]:
     normalized_dir = data_dir / "normalized"
     if not normalized_dir.exists():
         return []
-    return sorted(path for path in normalized_dir.glob("*.csv") if read_header(path))
+    return sorted(
+        path
+        for path in normalized_dir.glob("*.csv")
+        if read_header(path) and (tables is None or path.stem in tables)
+    )
 
 
 def canonical_table_name(path: Path) -> str:
@@ -308,8 +333,14 @@ def load_table(cur, schema: str, table: str, paths: list[Path], columns: list[tu
     )
 
 
-def load_canonical_tables(cur, data_dir: Path, schema: str, load_id: str) -> set[str]:
-    paths = canonical_files(data_dir)
+def load_canonical_tables(
+    cur,
+    data_dir: Path,
+    schema: str,
+    load_id: str,
+    tables: set[str] | None = None,
+) -> set[str]:
+    paths = canonical_files(data_dir, tables=tables)
     if not paths:
         print(f"skip canonical tables: {data_dir / 'normalized'} has no loadable CSV files")
         return set()
@@ -332,13 +363,26 @@ def load_csvs(
     *,
     load_id: str | None = None,
     strict: bool = False,
+    tables: set[str] | None = None,
+    create_database: bool = False,
+    maintenance_database: str = "postgres",
 ) -> str:
     load_id = load_id or str(uuid.uuid4())
+    if create_database:
+        ensure_database_exists(config, maintenance_database=maintenance_database)
+
+    if strict and tables:
+        available = {path.stem for path in canonical_files(data_dir, tables=tables)}
+        missing = sorted(tables - available)
+        if missing:
+            raise FileNotFoundError(
+                f"Missing normalized CSV files for tables: {', '.join(missing)}"
+            )
 
     with connect(config) as conn:
         with conn.cursor() as cur:
             ensure_metadata(cur, schema)
-            loaded_tables = load_canonical_tables(cur, data_dir, schema, load_id)
+            loaded_tables = load_canonical_tables(cur, data_dir, schema, load_id, tables=tables)
             if loaded_tables:
                 print(
                     f"loaded {len(loaded_tables)} raw tables in append mode; "
