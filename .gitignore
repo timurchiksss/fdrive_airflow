@@ -1,7 +1,8 @@
 .venv
-dags/__pycache__
+**/__pycache__
 logs
 secrets
 .envdata
 data
 backups/
+**/.DS_Store
