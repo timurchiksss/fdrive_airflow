@@ -1,0 +1,68 @@
+x-airflow-common: &airflow-common
+  build: .
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:scSD6QCahyMhCsdxyW10@fdrivedataairflow-fdrive-ucfmoa:5432/fdrive
+    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "30"
+    FDRIVE_PROJECT_ROOT: /opt/airflow
+    PYTHONPATH: "/opt/airflow:/opt/airflow/parsers:/opt/airflow/scripts:/opt/airflow/parsers/code for parser"
+    RAW_PGHOST: ${RAW_PGHOST:-fdrivedataairflow-fdrive-ucfmoa}
+    RAW_PGPORT: ${RAW_PGPORT:-5432}
+    RAW_PGUSER: ${RAW_PGUSER:-postgres}
+    RAW_PGPASSWORD: ${RAW_PGPASSWORD:-scSD6QCahyMhCsdxyW10}
+    RAW_PGDATABASE: ${RAW_PGDATABASE:-fdrive}
+    PGHOST: ${PGHOST:-fdrivedataairflow-fdrive-ucfmoa}
+    PGPORT: ${PGPORT:-5432}
+    PGUSER: ${PGUSER:-postgres}
+    PGPASSWORD: ${PGPASSWORD:-scSD6QCahyMhCsdxyW10}
+    PGDATABASE: ${PGDATABASE:-fdrive}
+    MARKETPLACE_PGDATABASE: ${MARKETPLACE_PGDATABASE:-fdrive}
+    MARKETPLACE_MAINTENANCE_DATABASE: ${MARKETPLACE_MAINTENANCE_DATABASE:-postgres}
+    RAW_SCHEMA: ${RAW_SCHEMA:-raw}
+    CLEAN_SCHEMA: ${CLEAN_SCHEMA:-cleanned}
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./parsers:/opt/airflow/parsers
+    - ./scripts:/opt/airflow/scripts
+    - ./cleaning_all.py:/opt/airflow/cleaning_all.py
+    - ./data:/opt/airflow/data
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./secrets:/opt/airflow/secrets
+  user: "${AIRFLOW_UID:-50000}:0"
+
+services:
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common
+    command: >
+      bash -c "
+      mkdir -p /opt/airflow/data /opt/airflow/logs /opt/airflow/plugins /opt/airflow/secrets &&
+      airflow db migrate &&
+      (airflow users create
+        --username admin
+        --password admin
+        --firstname Admin
+        --lastname User
+        --role Admin
+        --email admin@example.com || true)
+      "
