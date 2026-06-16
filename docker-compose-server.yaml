@@ -1,5 +1,7 @@
 x-airflow-common: &airflow-common
-  build: .
+  build:
+    context: .
+    dockerfile: Dockerfile.server
   environment:
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:scSD6QCahyMhCsdxyW10@fdrivedataairflow-fdrive-ucfmoa:5432/fdrive
@@ -25,14 +27,10 @@ x-airflow-common: &airflow-common
     RAW_SCHEMA: ${RAW_SCHEMA:-raw}
     CLEAN_SCHEMA: ${CLEAN_SCHEMA:-cleanned}
   volumes:
-    - ./dags:/opt/airflow/dags
-    - ./parsers:/opt/airflow/parsers
-    - ./scripts:/opt/airflow/scripts
-    - ./cleaning_all.py:/opt/airflow/cleaning_all.py
-    - ./data:/opt/airflow/data
-    - ./logs:/opt/airflow/logs
-    - ./plugins:/opt/airflow/plugins
-    - ./secrets:/opt/airflow/secrets
+    - airflow-data:/opt/airflow/data
+    - airflow-logs:/opt/airflow/logs
+    - airflow-plugins:/opt/airflow/plugins
+    - airflow-secrets:/opt/airflow/secrets
   user: "${AIRFLOW_UID:-50000}:0"
 
 services:
@@ -66,3 +64,9 @@ services:
         --role Admin
         --email admin@example.com || true)
       "
+
+volumes:
+  airflow-data:
+  airflow-logs:
+  airflow-plugins:
+  airflow-secrets:
