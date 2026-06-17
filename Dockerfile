@@ -36,3 +36,5 @@ RUN PYTHONPATH=/home/airflow/.local/lib/python${PYTHON_VERSION}/site-packages \
 USER airflow
 
 RUN /home/airflow/.local/bin/playwright install chromium
+
+CMD ["standalone"]
