@@ -1,3 +1,4 @@
+import os
 import re
 import sys
 import pandas as pd
@@ -1962,6 +1963,13 @@ if __name__ == '__main__':
     unified_df.to_csv(unified_path, index=False)
     print(f"\n[merge] Сохранено: {unified_path}")
 
-    DB_URL = 'postgresql://readonly_user:ZpUSlM6Hdsc1tp14@91.243.71.68:5870/fdrive'
+    DB_URL = os.environ.get("DATABASE_URL") or os.environ.get("DB_URL") or (
+        "postgresql://"
+        f"{os.environ.get('PGUSER', 'airflow')}:"
+        f"{os.environ.get('PGPASSWORD', 'airflow')}@"
+        f"{os.environ.get('PGHOST', 'postgres')}:"
+        f"{os.environ.get('PGPORT', '5432')}/"
+        f"{os.environ.get('PGDATABASE', 'airflow')}"
+    )
     load_to_db(unified_df, table_name='unified_products', db_url=DB_URL)
  
