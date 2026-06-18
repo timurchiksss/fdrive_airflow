@@ -269,6 +269,27 @@ def parse_forte_market() -> None:
 
 
 def postgres_config_for_new_database() -> PostgresConfig:
+    env_config = config_from_env()
+    if any(
+        os.environ.get(name)
+        for name in (
+            "RAW_PGHOST",
+            "PGHOST",
+            "RAW_PGUSER",
+            "PGUSER",
+            "RAW_PGPASSWORD",
+            "PGPASSWORD",
+            "MARKETPLACE_PGDATABASE",
+        )
+    ):
+        return PostgresConfig(
+            host=env_config.host,
+            port=env_config.port,
+            user=env_config.user,
+            password=env_config.password,
+            database=config_value("MARKETPLACE_PGDATABASE", "fdrive_marketplace_v2"),
+        )
+
     try:
         connection_id = config_value("MARKETPLACE_POSTGRES_CONN_ID", "fdrive_raw_postgres")
         conn = BaseHook.get_connection(connection_id)
@@ -280,7 +301,6 @@ def postgres_config_for_new_database() -> PostgresConfig:
             database="",
         )
     except AirflowNotFoundException:
-        env_config = config_from_env()
         base = PostgresConfig(
             host=env_config.host,
             port=env_config.port,
