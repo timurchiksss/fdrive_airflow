@@ -10,8 +10,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from airflow import DAG
-from airflow.exceptions import AirflowNotFoundException
-from airflow.hooks.base import BaseHook
 from airflow.models import Variable
 from airflow.operators.empty import EmptyOperator
 from airflow.operators.python import PythonOperator, get_current_context
@@ -43,7 +41,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from normalize_catalog_csvs import normalize as normalize_catalog_csvs  # noqa: E402
-from raw_postgres_loader import PostgresConfig, config_from_env, load_csvs  # noqa: E402
+from raw_postgres_loader import PostgresConfig, load_csvs  # noqa: E402
 
 
 def optional_config_value(name: str) -> str | None:
@@ -148,6 +146,11 @@ def parse_fdrive() -> None:
     load_id = current_load_id()
     postgres_config = postgres_config_for_new_database()
     raw_env = raw_postgres_env(postgres_config)
+    print(
+        "FDrive raw DB: "
+        f"{postgres_config.user}@{postgres_config.host}:{postgres_config.port}/{postgres_config.database}",
+        flush=True,
+    )
     run_cmd(
         [
             sys.executable,
@@ -269,52 +272,19 @@ def parse_forte_market() -> None:
 
 
 def postgres_config_for_new_database() -> PostgresConfig:
-    env_config = config_from_env()
-    if any(
-        os.environ.get(name)
-        for name in (
-            "RAW_PGHOST",
-            "PGHOST",
-            "RAW_PGUSER",
-            "PGUSER",
-            "RAW_PGPASSWORD",
-            "PGPASSWORD",
-            "MARKETPLACE_PGDATABASE",
-        )
-    ):
-        return PostgresConfig(
-            host=env_config.host,
-            port=env_config.port,
-            user=env_config.user,
-            password=env_config.password,
-            database=config_value("MARKETPLACE_PGDATABASE", "fdrive_marketplace_v2"),
-        )
-
-    try:
-        connection_id = config_value("MARKETPLACE_POSTGRES_CONN_ID", "fdrive_raw_postgres")
-        conn = BaseHook.get_connection(connection_id)
-        base = PostgresConfig(
-            host=conn.host or "postgres",
-            port=conn.port or 5432,
-            user=conn.login or "airflow",
-            password=conn.password or os.environ.get("RAW_PGPASSWORD") or "airflow",
-            database="",
-        )
-    except AirflowNotFoundException:
-        base = PostgresConfig(
-            host=env_config.host,
-            port=env_config.port,
-            user=env_config.user,
-            password=env_config.password,
-            database="",
-        )
-
+    # Keep parser subprocesses pointed at the marketplace/raw DB, not the
+    # Airflow metadata connection. Airflow Connection fdrive_raw_postgres may
+    # still exist with a local-only host like "postgres", which is not
+    # resolvable in the server deployment.
     return PostgresConfig(
-        host=base.host,
-        port=base.port,
-        user=base.user,
-        password=base.password,
-        database=config_value("MARKETPLACE_PGDATABASE", "fdrive_marketplace_v2"),
+        host=config_value("RAW_PGHOST", config_value("PGHOST", "fdrivedataairflow-fdrive-ucfmoa")),
+        port=int(config_value("RAW_PGPORT", config_value("PGPORT", "5432"))),
+        user=config_value("RAW_PGUSER", config_value("PGUSER", "postgres")),
+        password=config_value("RAW_PGPASSWORD", config_value("PGPASSWORD", "scSD6QCahyMhCsdxyW10")),
+        database=config_value(
+            "MARKETPLACE_PGDATABASE",
+            config_value("RAW_PGDATABASE", config_value("PGDATABASE", "fdrive")),
+        ),
     )
 
 
