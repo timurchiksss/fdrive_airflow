@@ -399,8 +399,10 @@ def normalize(data_dir: Path, max_rows: int = 15000, sources: set[str] | None = 
     if wanted_source("fdrive", sources):
         outputs[("fdrive", "tires")]
         outputs[("fdrive", "oils")]
+        outputs[("fdrive", "batteries")]
         add_category_file(outputs, data_dir / "fdrive_tyres_almaty_full.csv", "fdrive", "tires")
         add_category_file(outputs, data_dir / "fdrive_masla_i_zhidkosti_full.csv", "fdrive", "oils")
+        add_category_file(outputs, data_dir / "fdrive_akkumulyatory_full.csv", "fdrive", "batteries")
     if wanted_source("almatyres", sources):
         add_category_file(outputs, data_dir / "almatyres_products.csv", "almatyres", "tires")
 

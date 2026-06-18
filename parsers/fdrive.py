@@ -102,14 +102,14 @@ def parse_listing_page(next_data: dict[str, Any]) -> ListingPage:
     page_props = next_data.get("props", {}).get("pageProps", {})
     listing_data = page_props.get("listingData") or {}
     result = listing_data.get("result") or {}
-    products = result.get("listing") or []
+    products = listing_data.get("items") or result.get("listing") or []
     category = result.get("category") or {}
 
     return ListingPage(
         page=int(listing_data.get("page") or 1),
-        total_count=int(listing_data.get("count") or len(products)),
-        products=products,
-        category_name=category.get("name") or "",
+        total_count=int(listing_data.get("totalCount") or listing_data.get("count") or len(products)),
+        products=products if isinstance(products, list) else [],
+        category_name=listing_data.get("categoryName") or category.get("name") or "",
         raw_listing_data=listing_data,
     )
 
@@ -123,7 +123,7 @@ def product_url(product: dict[str, Any]) -> str:
 
 def images(product: dict[str, Any]) -> list[str]:
     result = []
-    for item in product.get("media") or []:
+    for item in product.get("media") or product.get("images") or []:
         image_path = item.get("image_path") or item.get("url") or item.get("src")
         if image_path:
             result.append(image_path)
@@ -156,21 +156,39 @@ def city_from_url(url: str) -> str:
     return path_parts[0] if path_parts and path_parts[0] not in {"tyres", "p", "tyre"} else "almaty"
 
 
+def first_number(pattern: str, text: str) -> str:
+    match = re.search(pattern, text or "", re.IGNORECASE)
+    return match.group(1).replace(",", ".") if match else ""
+
+
+def derived_attrs(product: dict[str, Any], fallback_category: str) -> dict[str, Any]:
+    title = str(product.get("title") or product.get("name") or "")
+    category_text = fallback_category.lower()
+    attrs: dict[str, Any] = {}
+    if "аккум" in category_text or "аккум" in title.lower():
+        attrs["capacity_ah"] = first_number(r"(\d{2,3})\s*(?:ah|а[./\\s-]*ч|ач)", title)
+        attrs["voltage_v"] = first_number(r"\b(6|12|24)\s*(?:v|в|вольт)", title)
+    return {key: value for key, value in attrs.items() if value not in (None, "")}
+
+
 def flatten_product(product: dict[str, Any], fallback_category: str, parsed_at: str, city: str) -> dict[str, Any]:
     info = as_dict(product.get("info"))
     cost = as_dict(product.get("cost_info"))
+    analytics = as_dict(product.get("analytics"))
     categories = as_list(product.get("categories"))
     category_names = [as_dict(c).get("name") for c in categories if as_dict(c).get("name")]
 
     row: dict[str, Any] = {
         "product_id": product.get("productId") or product.get("id") or "",
-        "name": info.get("title") or product.get("name") or "",
-        "price": cost.get("price") or "",
-        "price_old": cost.get("price_old") or "",
+        "name": info.get("title") or product.get("title") or product.get("name") or "",
+        "price": cost.get("price") or product.get("finalPrice") or product.get("price") or "",
+        "price_old": cost.get("price_old") or product.get("oldPrice") or "",
         "url": product_url(product),
         "slug": product.get("slug") or "",
         "category": " | ".join(category_names) or fallback_category,
-        "brand_name": info.get("brand_name") or "",
+        "brand": info.get("brand_name") or analytics.get("brand") or "",
+        "brand_name": info.get("brand_name") or analytics.get("brand") or "",
+        "quantity_available": product.get("maxAvailableCount") or "",
         "images": " | ".join(images(product)),
         "listing_page": product.get("_listing_page") or "",
         "listing_index": product.get("_listing_index") or "",
@@ -180,6 +198,7 @@ def flatten_product(product: dict[str, Any], fallback_category: str, parsed_at: 
 
     for key, value in attr_map(product).items():
         row[key] = value
+    row.update(derived_attrs(product, fallback_category))
 
     return row
 
@@ -267,8 +286,8 @@ def save_csv(rows: list[dict[str, Any]], path: Path) -> None:
 
 
 def save_empty_csv(path: Path, group: str) -> None:
-    columns = (
-        [
+    if group == "tires":
+        columns = [
             "product_id",
             "name",
             "price",
@@ -293,8 +312,27 @@ def save_empty_csv(path: Path, group: str) -> None:
             "city",
             "parsed_at",
         ]
-        if group == "tires"
-        else [
+    elif group == "batteries":
+        columns = [
+            "product_id",
+            "name",
+            "price",
+            "url",
+            "slug",
+            "category",
+            "brand",
+            "brand_name",
+            "images",
+            "quantity_available",
+            "capacity_ah",
+            "voltage_v",
+            "listing_page",
+            "listing_index",
+            "city",
+            "parsed_at",
+        ]
+    else:
+        columns = [
             "product_id",
             "name",
             "price",
@@ -309,7 +347,6 @@ def save_empty_csv(path: Path, group: str) -> None:
             "city",
             "parsed_at",
         ]
-    )
     with path.open("w", encoding="utf-8-sig", newline="") as file:
         csv.DictWriter(file, fieldnames=columns).writeheader()
 
@@ -532,6 +569,7 @@ def main() -> int:
     parser.add_argument("--retries", type=int, default=4, help="Повторы transient HTTP/JSON ошибок.")
     parser.add_argument("--retry-sleep", type=float, default=2.0, help="Базовая пауза между повторами.")
     parser.add_argument("--stream-raw-db", action="store_true", help="Сразу писать страницы в raw Postgres.")
+    parser.add_argument("--group", choices=["tires", "oils", "batteries", "filters"], default="")
     parser.add_argument("--raw-schema", default="raw", help="Postgres schema for --stream-raw-db.")
     parser.add_argument("--load-id", default="", help="load_id для raw Postgres. По умолчанию текущий timestamp.")
     parser.add_argument("--raw-table", default="", help="Имя raw-таблицы. По умолчанию fdrive_tires/fdrive_oils.")
@@ -541,8 +579,8 @@ def main() -> int:
 
     csv_path = Path(args.out or safe_output_name(args.url))
     started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    group = "tires" if "/tyres/" in args.url else "oils"
-    table = args.raw_table or ("fdrive_tires" if group == "tires" else "fdrive_oils")
+    group = args.group or ("tires" if "/tyres/" in args.url else "oils")
+    table = args.raw_table or f"fdrive_{group}"
     load_id = args.load_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     on_rows, raw_writer = build_raw_stream_callback(
         enabled=args.stream_raw_db,

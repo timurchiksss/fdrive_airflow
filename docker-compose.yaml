@@ -11,7 +11,7 @@ x-airflow-common: &airflow-common
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
     AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "30"
     FDRIVE_PROJECT_ROOT: /opt/airflow
-    PYTHONPATH: "/opt/airflow:/opt/airflow/parsers:/opt/airflow/scripts:/opt/airflow/parsers/code for parser"
+    PYTHONPATH: "/opt/airflow:/opt/airflow/parsers:/opt/airflow/scripts:/opt/airflow/matching:/opt/airflow/parsers/code for parser"
     RAW_PGHOST: ${RAW_PGHOST:-postgres}
     RAW_PGPORT: ${RAW_PGPORT:-5432}
     RAW_PGUSER: ${RAW_PGUSER:-airflow}
@@ -21,10 +21,12 @@ x-airflow-common: &airflow-common
     MARKETPLACE_MAINTENANCE_DATABASE: ${MARKETPLACE_MAINTENANCE_DATABASE:-postgres}
     RAW_SCHEMA: ${RAW_SCHEMA:-raw}
     CLEAN_SCHEMA: ${CLEAN_SCHEMA:-cleanned}
+    MATCH_SCHEMA: ${MATCH_SCHEMA:-matching}
   volumes:
     - ./dags:/opt/airflow/dags
     - ./parsers:/opt/airflow/parsers
     - ./scripts:/opt/airflow/scripts
+    - ./matching:/opt/airflow/matching
     - ./cleaning_all.py:/opt/airflow/cleaning_all.py
     - ./data:/opt/airflow/data
     - ./logs:/opt/airflow/logs

@@ -12,6 +12,7 @@ RUN mkdir -p /ms-playwright \
     /opt/airflow/dags \
     /opt/airflow/parsers \
     /opt/airflow/scripts \
+    /opt/airflow/matching \
     /opt/airflow/data \
     /opt/airflow/logs \
     /opt/airflow/plugins \
@@ -49,6 +50,7 @@ RUN /home/airflow/.local/bin/playwright install chromium
 COPY --chown=airflow:0 dags /opt/airflow/dags
 COPY --chown=airflow:0 parsers /opt/airflow/parsers
 COPY --chown=airflow:0 scripts /opt/airflow/scripts
+COPY --chown=airflow:0 matching /opt/airflow/matching
 COPY --chown=airflow:0 cleaning_all.py /opt/airflow/cleaning_all.py
 
 CMD ["standalone"]
