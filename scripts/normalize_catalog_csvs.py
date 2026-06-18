@@ -100,8 +100,6 @@ def read_rows(path: Path) -> list[dict[str, str]]:
 
 
 def write_csv(path: Path, rows: list[dict[str, str]], columns: list[str]) -> None:
-    if not rows:
-        return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=columns, extrasaction="ignore")
@@ -399,6 +397,8 @@ def normalize(data_dir: Path, max_rows: int = 15000, sources: set[str] | None = 
                 add_category_file(outputs, data_dir / source / f"{source}_{group}.csv", source, group)
 
     if wanted_source("fdrive", sources):
+        outputs[("fdrive", "tires")]
+        outputs[("fdrive", "oils")]
         add_category_file(outputs, data_dir / "fdrive_tyres_almaty_full.csv", "fdrive", "tires")
         add_category_file(outputs, data_dir / "fdrive_masla_i_zhidkosti_full.csv", "fdrive", "oils")
     if wanted_source("almatyres", sources):
@@ -463,9 +463,8 @@ def normalize(data_dir: Path, max_rows: int = 15000, sources: set[str] | None = 
         columns = SCHEMAS[group]
         path = out_dir / f"{safe_name(source)}_{group}.csv"
         write_csv(path, rows, columns)
-        if rows:
-            written.append(path)
-            print(f"normalized {len(rows)} rows -> {path}", flush=True)
+        written.append(path)
+        print(f"normalized {len(rows)} rows -> {path}", flush=True)
 
     return written
 

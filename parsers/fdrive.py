@@ -23,8 +23,9 @@ import re
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 import requests
@@ -63,16 +64,38 @@ def build_tyres_page_url(start_url: str, page: int) -> str:
     return f"{start_url}/page{page}"
 
 
-def fetch_next_data(session: requests.Session, url: str, timeout: int = 30) -> dict[str, Any]:
-    response = session.get(url, timeout=timeout)
-    response.raise_for_status()
+def fetch_next_data(
+    session: requests.Session,
+    url: str,
+    timeout: int = 30,
+    retries: int = 3,
+    retry_sleep: float = 2.0,
+) -> dict[str, Any]:
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            response = session.get(url, timeout=timeout)
+            response.raise_for_status()
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    script = soup.select_one("#__NEXT_DATA__")
-    if not script or not script.string:
-        raise RuntimeError(f"Не найден __NEXT_DATA__ на странице: {url}")
+            soup = BeautifulSoup(response.text, "html.parser")
+            script = soup.select_one("#__NEXT_DATA__")
+            if not script or not script.string:
+                raise RuntimeError(f"Не найден __NEXT_DATA__ на странице: {url}")
 
-    return json.loads(script.string)
+            return json.loads(script.string)
+        except (requests.RequestException, RuntimeError, json.JSONDecodeError) as exc:
+            last_error = exc
+            if attempt >= retries:
+                break
+            delay = retry_sleep * attempt
+            print(
+                f"Ошибка загрузки {url}: {type(exc).__name__}: {exc}; "
+                f"retry {attempt}/{retries - 1} через {delay:.1f}s",
+                flush=True,
+            )
+            time.sleep(delay)
+    assert last_error is not None
+    raise last_error
 
 
 def parse_listing_page(next_data: dict[str, Any]) -> ListingPage:
@@ -128,7 +151,12 @@ def attr_map(product: dict[str, Any]) -> dict[str, str]:
     return attrs
 
 
-def flatten_product(product: dict[str, Any], fallback_category: str) -> dict[str, Any]:
+def city_from_url(url: str) -> str:
+    path_parts = [part for part in urlparse(url).path.split("/") if part]
+    return path_parts[0] if path_parts and path_parts[0] not in {"tyres", "p", "tyre"} else "almaty"
+
+
+def flatten_product(product: dict[str, Any], fallback_category: str, parsed_at: str, city: str) -> dict[str, Any]:
     info = as_dict(product.get("info"))
     cost = as_dict(product.get("cost_info"))
     categories = as_list(product.get("categories"))
@@ -146,6 +174,8 @@ def flatten_product(product: dict[str, Any], fallback_category: str) -> dict[str
         "images": " | ".join(images(product)),
         "listing_page": product.get("_listing_page") or "",
         "listing_index": product.get("_listing_index") or "",
+        "city": city,
+        "parsed_at": parsed_at,
     }
 
     for key, value in attr_map(product).items():
@@ -162,7 +192,7 @@ def as_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
-def flatten_tyre(product: dict[str, Any]) -> dict[str, Any]:
+def flatten_tyre(product: dict[str, Any], parsed_at: str, city: str) -> dict[str, Any]:
     product_type_raw = product.get("productType")
     product_type = as_dict(product_type_raw)
     product_type_text = product_type_raw if isinstance(product_type_raw, str) else ""
@@ -191,6 +221,8 @@ def flatten_tyre(product: dict[str, Any]) -> dict[str, Any]:
         "images": " | ".join(tyre_images(product)),
         "listing_page": product.get("_listing_page") or "",
         "listing_index": product.get("_listing_index") or "",
+        "city": city,
+        "parsed_at": parsed_at,
     }
 
 
@@ -217,6 +249,8 @@ def save_csv(rows: list[dict[str, Any]], path: Path) -> None:
         "images",
         "listing_page",
         "listing_index",
+        "city",
+        "parsed_at",
     ]
     for col in preferred:
         if any(col in row for row in rows):
@@ -232,12 +266,66 @@ def save_csv(rows: list[dict[str, Any]], path: Path) -> None:
         writer.writerows(rows)
 
 
+def save_empty_csv(path: Path, group: str) -> None:
+    columns = (
+        [
+            "product_id",
+            "name",
+            "price",
+            "url",
+            "slug",
+            "brand",
+            "season",
+            "size",
+            "width",
+            "height",
+            "diameter",
+            "weight_single_index",
+            "weight_double_index",
+            "velocity_index",
+            "quantity_available",
+            "tyre_auto_type_name",
+            "tyre_stud_type_name",
+            "is_ecar",
+            "images",
+            "listing_page",
+            "listing_index",
+            "city",
+            "parsed_at",
+        ]
+        if group == "tires"
+        else [
+            "product_id",
+            "name",
+            "price",
+            "price_old",
+            "url",
+            "slug",
+            "category",
+            "brand_name",
+            "images",
+            "listing_page",
+            "listing_index",
+            "city",
+            "parsed_at",
+        ]
+    )
+    with path.open("w", encoding="utf-8-sig", newline="") as file:
+        csv.DictWriter(file, fieldnames=columns).writeheader()
+
+
 def scrape_category(
     start_url: str,
     delay: float,
     dedupe: bool = False,
     max_products: int = 0,
+    parsed_at: str = "",
+    on_rows: Callable[[list[dict[str, Any]]], None] | None = None,
+    retries: int = 3,
+    retry_sleep: float = 2.0,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    parsed_at = parsed_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
+    city = city_from_url(start_url)
     session = requests.Session()
     session.headers.update(
         {
@@ -250,7 +338,7 @@ def scrape_category(
 
     first_url = build_page_url(start_url, 1)
     print(f"Загружаю страницу 1: {first_url}")
-    first_page = parse_listing_page(fetch_next_data(session, first_url))
+    first_page = parse_listing_page(fetch_next_data(session, first_url, retries=retries, retry_sleep=retry_sleep))
 
     if not first_page.products:
         return [], []
@@ -265,8 +353,8 @@ def scrape_category(
     raw_products: list[dict[str, Any]] = []
     seen: set[str] = set()
 
-    def add_products(products: list[dict[str, Any]], page: int) -> int:
-        added = 0
+    def add_products(products: list[dict[str, Any]], page: int) -> list[dict[str, Any]]:
+        added_products = []
         for index, product in enumerate(products, 1):
             if max_products and len(raw_products) >= max_products:
                 break
@@ -281,11 +369,13 @@ def scrape_category(
             if key:
                 seen.add(key)
             raw_products.append(product)
-            added += 1
-        return added
+            added_products.append(product)
+        return added_products
 
-    added = add_products(first_page.products, 1)
-    print(f"Страница 1: +{added}, всего {len(raw_products)}")
+    added_products = add_products(first_page.products, 1)
+    if on_rows:
+        on_rows([flatten_product(product, first_page.category_name, parsed_at, city) for product in added_products])
+    print(f"Страница 1: +{len(added_products)}, всего {len(raw_products)}")
 
     for page in range(2, total_pages + 1):
         if max_products and len(raw_products) >= max_products:
@@ -294,11 +384,13 @@ def scrape_category(
         url = build_page_url(start_url, page)
         time.sleep(delay)
         print(f"Загружаю страницу {page}: {url}")
-        listing_page = parse_listing_page(fetch_next_data(session, url))
-        added = add_products(listing_page.products, page)
-        print(f"Страница {page}: +{added}, всего {len(raw_products)}")
+        listing_page = parse_listing_page(fetch_next_data(session, url, retries=retries, retry_sleep=retry_sleep))
+        added_products = add_products(listing_page.products, page)
+        if on_rows:
+            on_rows([flatten_product(product, first_page.category_name, parsed_at, city) for product in added_products])
+        print(f"Страница {page}: +{len(added_products)}, всего {len(raw_products)}")
 
-    rows = [flatten_product(product, first_page.category_name) for product in raw_products]
+    rows = [flatten_product(product, first_page.category_name, parsed_at, city) for product in raw_products]
     return rows, raw_products
 
 
@@ -308,7 +400,13 @@ def scrape_tyres(
     dedupe: bool = False,
     max_pages: int = 0,
     max_products: int = 0,
+    parsed_at: str = "",
+    on_rows: Callable[[list[dict[str, Any]]], None] | None = None,
+    retries: int = 3,
+    retry_sleep: float = 2.0,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    parsed_at = parsed_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
+    city = city_from_url(start_url)
     session = requests.Session()
     session.headers.update(
         {
@@ -320,7 +418,12 @@ def scrape_tyres(
     )
 
     print(f"Загружаю страницу 1: {start_url}")
-    next_data = fetch_next_data(session, build_tyres_page_url(start_url, 1))
+    next_data = fetch_next_data(
+        session,
+        build_tyres_page_url(start_url, 1),
+        retries=retries,
+        retry_sleep=retry_sleep,
+    )
     listing = next_data.get("props", {}).get("pageProps", {}).get("listingResults") or {}
     first_products = listing.get("results") or []
     if not first_products:
@@ -337,8 +440,8 @@ def scrape_tyres(
     raw_products: list[dict[str, Any]] = []
     seen: set[str] = set()
 
-    def add_products(products: list[dict[str, Any]], page: int) -> int:
-        added = 0
+    def add_products(products: list[dict[str, Any]], page: int) -> list[dict[str, Any]]:
+        added_products = []
         for index, product in enumerate(products, 1):
             if max_products and len(raw_products) >= max_products:
                 break
@@ -353,11 +456,13 @@ def scrape_tyres(
             if key:
                 seen.add(key)
             raw_products.append(product)
-            added += 1
-        return added
+            added_products.append(product)
+        return added_products
 
-    added = add_products(first_products, 1)
-    print(f"Страница 1: +{added}, всего {len(raw_products)}")
+    added_products = add_products(first_products, 1)
+    if on_rows:
+        on_rows([flatten_tyre(product, parsed_at, city) for product in added_products])
+    print(f"Страница 1: +{len(added_products)}, всего {len(raw_products)}")
 
     for page in range(2, total_pages + 1):
         if max_products and len(raw_products) >= max_products:
@@ -366,14 +471,54 @@ def scrape_tyres(
         url = build_tyres_page_url(start_url, page)
         time.sleep(delay)
         print(f"Загружаю страницу {page}: {url}")
-        next_data = fetch_next_data(session, url)
+        next_data = fetch_next_data(session, url, retries=retries, retry_sleep=retry_sleep)
         listing = next_data.get("props", {}).get("pageProps", {}).get("listingResults") or {}
         products = listing.get("results") or []
-        added = add_products(products, page)
-        print(f"Страница {page}: +{added}, всего {len(raw_products)}")
+        added_products = add_products(products, page)
+        if on_rows:
+            on_rows([flatten_tyre(product, parsed_at, city) for product in added_products])
+        print(f"Страница {page}: +{len(added_products)}, всего {len(raw_products)}")
 
-    rows = [flatten_tyre(product) for product in raw_products]
+    rows = [flatten_tyre(product, parsed_at, city) for product in raw_products]
     return rows, raw_products
+
+
+def build_raw_stream_callback(
+    *,
+    enabled: bool,
+    group: str,
+    table: str,
+    load_id: str,
+    source_file: Path,
+    schema: str,
+    create_database: bool,
+    maintenance_database: str,
+) -> tuple[Callable[[list[dict[str, Any]]], None] | None, Any | None]:
+    if not enabled:
+        return None, None
+
+    scripts_dir = Path(__file__).resolve().parents[1] / "scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    from normalize_catalog_csvs import CANONICALIZERS, SCHEMAS  # noqa: PLC0415
+    from streaming_raw_writer import StreamingRawWriter  # noqa: PLC0415
+
+    writer = StreamingRawWriter.from_env(
+        schema=schema,
+        load_id=load_id,
+        source_file=source_file,
+        create_database=create_database,
+        maintenance_database=maintenance_database,
+    )
+    canonicalizer = CANONICALIZERS[group]
+    columns = SCHEMAS[group]
+
+    def on_rows(rows: list[dict[str, Any]]) -> None:
+        canonical_rows = [canonicalizer(row, "fdrive") for row in rows]
+        written = writer.write_rows(table, canonical_rows, columns)
+        print(f"[raw-db] {schema}.{table}: +{written}, load_id={load_id}", flush=True)
+
+    return on_rows, writer
 
 
 def main() -> int:
@@ -384,28 +529,64 @@ def main() -> int:
     parser.add_argument("--dedupe", action="store_true", help="Удалять повторы по productId/slug.")
     parser.add_argument("--max-pages", type=int, default=0, help="Ограничить число страниц для теста.")
     parser.add_argument("--max-products", type=int, default=0, help="Ограничить число товаров. 0 значит без лимита.")
+    parser.add_argument("--retries", type=int, default=4, help="Повторы transient HTTP/JSON ошибок.")
+    parser.add_argument("--retry-sleep", type=float, default=2.0, help="Базовая пауза между повторами.")
+    parser.add_argument("--stream-raw-db", action="store_true", help="Сразу писать страницы в raw Postgres.")
+    parser.add_argument("--raw-schema", default="raw", help="Postgres schema for --stream-raw-db.")
+    parser.add_argument("--load-id", default="", help="load_id для raw Postgres. По умолчанию текущий timestamp.")
+    parser.add_argument("--raw-table", default="", help="Имя raw-таблицы. По умолчанию fdrive_tires/fdrive_oils.")
+    parser.add_argument("--create-database", action="store_true", help="Создать БД перед streaming insert, если ее нет.")
+    parser.add_argument("--maintenance-database", default="postgres")
     args = parser.parse_args()
 
     csv_path = Path(args.out or safe_output_name(args.url))
+    started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    group = "tires" if "/tyres/" in args.url else "oils"
+    table = args.raw_table or ("fdrive_tires" if group == "tires" else "fdrive_oils")
+    load_id = args.load_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    on_rows, raw_writer = build_raw_stream_callback(
+        enabled=args.stream_raw_db,
+        group=group,
+        table=table,
+        load_id=load_id,
+        source_file=csv_path,
+        schema=args.raw_schema,
+        create_database=args.create_database,
+        maintenance_database=args.maintenance_database,
+    )
 
-    if "/tyres/" in args.url:
-        rows, raw_products = scrape_tyres(
-            args.url,
-            args.delay,
-            dedupe=args.dedupe,
-            max_pages=args.max_pages,
-            max_products=args.max_products,
-        )
-    else:
-        rows, raw_products = scrape_category(
-            args.url,
-            args.delay,
-            dedupe=args.dedupe,
-            max_products=args.max_products,
-        )
+    try:
+        if group == "tires":
+            rows, raw_products = scrape_tyres(
+                args.url,
+                args.delay,
+                dedupe=args.dedupe,
+                max_pages=args.max_pages,
+                max_products=args.max_products,
+                parsed_at=started_at,
+                on_rows=on_rows,
+                retries=args.retries,
+                retry_sleep=args.retry_sleep,
+            )
+        else:
+            rows, raw_products = scrape_category(
+                args.url,
+                args.delay,
+                dedupe=args.dedupe,
+                max_products=args.max_products,
+                parsed_at=started_at,
+                on_rows=on_rows,
+                retries=args.retries,
+                retry_sleep=args.retry_sleep,
+            )
+    finally:
+        if raw_writer is not None:
+            raw_writer.close()
     if not rows:
         print("Товары не найдены.", file=sys.stderr)
-        return 1
+        save_empty_csv(csv_path, group)
+        print(f"Пустой CSV с заголовком: {csv_path.resolve()}")
+        return 0
 
     save_csv(rows, csv_path)
 

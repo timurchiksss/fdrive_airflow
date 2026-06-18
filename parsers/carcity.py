@@ -193,6 +193,8 @@ GROUP_OUTPUT_COLUMNS: dict[str, list[str]] = {
         "rating",
         "reviews_count",
         "seller_count",
+        "city",
+        "parsed_at",
         "model_name",
         "weight",
     ],
@@ -220,6 +222,8 @@ GROUP_OUTPUT_COLUMNS: dict[str, list[str]] = {
         "rating",
         "reviews_count",
         "seller_count",
+        "city",
+        "parsed_at",
     ],
     "filters": [
         "product_id",
@@ -242,6 +246,8 @@ GROUP_OUTPUT_COLUMNS: dict[str, list[str]] = {
         "rating",
         "reviews_count",
         "seller_count",
+        "city",
+        "parsed_at",
     ],
     "batteries": [
         "product_id",
@@ -270,6 +276,8 @@ GROUP_OUTPUT_COLUMNS: dict[str, list[str]] = {
         "rating",
         "reviews_count",
         "seller_count",
+        "city",
+        "parsed_at",
     ],
 }
 PRICE_HISTORY_COLUMNS = [
@@ -386,6 +394,8 @@ class Product:
                 self.reviews_count if self.reviews_count is not None else ""
             ),
             "seller_count": len(self.offers),
+            "city": self.city or "almaty",
+            "parsed_at": self.parsed_at,
         }
 
         if self.category_group == "tires":
@@ -1606,6 +1616,7 @@ class CarCityScraper:
             reviews_count=reviews_count,
             attributes=attributes,
             offers=offers,
+            city="almaty",
             parsed_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         )
 

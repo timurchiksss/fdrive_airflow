@@ -102,7 +102,7 @@ GROUP_OUTPUT_COLUMNS = {
         "weight_single_index", "weight_double_index", "velocity_index",
         "quantity_available", "tyre_auto_type_name", "tyre_stud_type_name",
         "is_ecar", "article_sku", "rating", "reviews_count", "seller_count",
-        "model_name", "weight",
+        "city", "parsed_at", "model_name", "weight",
     ],
     "oils": [
         "product_id", "name", "price", "url", "slug", "category",
@@ -110,14 +110,14 @@ GROUP_OUTPUT_COLUMNS = {
         "Класс вязкости SAE", "Объем упаковки, л", "Область применения",
         "Тип коробки передач", "Назначение", "Упаковка", "Класс ACEA",
         "Допуски", "Тип двигателя", "article_sku", "rating",
-        "reviews_count", "seller_count",
+        "reviews_count", "seller_count", "city", "parsed_at",
     ],
     "filters": [
         "product_id", "name", "price", "url", "slug", "category", "brand",
         "images", "quantity_available", "filter_type",
         "manufacturer_article", "compatible_brand", "compatible_model",
         "compatible_years", "oem_numbers", "additional_information",
-        "article_sku", "rating", "reviews_count", "seller_count",
+        "article_sku", "rating", "reviews_count", "seller_count", "city", "parsed_at",
     ],
     "batteries": [
         "product_id", "name", "price", "url", "slug", "category", "brand",
@@ -125,7 +125,7 @@ GROUP_OUTPUT_COLUMNS = {
         "start_current_a", "polarity", "battery_type", "dimensions",
         "terminal_type", "case_type", "weight", "features", "length",
         "width", "height", "article_sku", "rating", "reviews_count",
-        "seller_count",
+        "seller_count", "city", "parsed_at",
     ],
 }
 
@@ -1038,6 +1038,8 @@ def output_row(row: dict[str, Any], group: str) -> dict[str, Any]:
         "rating": row.get("rating", ""),
         "reviews_count": row.get("reviews_count", ""),
         "seller_count": row.get("seller_count", ""),
+        "city": row.get("city", ""),
+        "parsed_at": row.get("parsed_at", ""),
         "weight": row.get("weight", ""),
     }
     if group == "tires":

@@ -14,7 +14,7 @@ from airflow.exceptions import AirflowNotFoundException
 from airflow.hooks.base import BaseHook
 from airflow.models import Variable
 from airflow.operators.empty import EmptyOperator
-from airflow.operators.python import PythonOperator
+from airflow.operators.python import PythonOperator, get_current_context
 
 
 PROJECT_ROOT = Path(os.environ.get("FDRIVE_PROJECT_ROOT", Path(__file__).resolve().parents[1]))
@@ -65,8 +65,10 @@ def env_flag(name: str, default: bool = False) -> bool:
     return value in {"1", "true", "yes", "y", "on"}
 
 
-def run_cmd(args: list[str]) -> subprocess.CompletedProcess[str]:
+def run_cmd(args: list[str], extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     command_env = os.environ.copy()
+    if extra_env:
+        command_env.update(extra_env)
     command_env["PYTHONPATH"] = os.pathsep.join(
         str(path)
         for path in [PROJECT_ROOT, PARSERS_DIR, command_env.get("PYTHONPATH", "")]
@@ -86,6 +88,27 @@ def run_cmd(args: list[str]) -> subprocess.CompletedProcess[str]:
     if result.returncode:
         raise subprocess.CalledProcessError(result.returncode, args, output=result.stdout)
     return result
+
+
+def current_load_id() -> str:
+    try:
+        context = get_current_context()
+        dag_run = context.get("dag_run")
+        if dag_run is not None:
+            return f"{dag_run.dag_id}:{dag_run.run_id}"
+    except Exception:
+        pass
+    return str(uuid.uuid4())
+
+
+def raw_postgres_env(config: PostgresConfig) -> dict[str, str]:
+    return {
+        "RAW_PGHOST": config.host,
+        "RAW_PGPORT": str(config.port),
+        "RAW_PGUSER": config.user,
+        "RAW_PGPASSWORD": config.password,
+        "RAW_PGDATABASE": config.database,
+    }
 
 
 def normalize_source(source: str) -> None:
@@ -122,6 +145,9 @@ def copy_run_outputs(
 
 
 def parse_fdrive() -> None:
+    load_id = current_load_id()
+    postgres_config = postgres_config_for_new_database()
+    raw_env = raw_postgres_env(postgres_config)
     run_cmd(
         [
             sys.executable,
@@ -132,7 +158,18 @@ def parse_fdrive() -> None:
             "--dedupe",
             "--max-products",
             "0",
-        ]
+            "--stream-raw-db",
+            "--raw-schema",
+            config_value("RAW_SCHEMA", "raw"),
+            "--load-id",
+            load_id,
+            "--raw-table",
+            "fdrive_tires",
+            "--create-database",
+            "--maintenance-database",
+            config_value("MARKETPLACE_MAINTENANCE_DATABASE", "postgres"),
+        ],
+        extra_env=raw_env,
     )
     run_cmd(
         [
@@ -144,7 +181,18 @@ def parse_fdrive() -> None:
             "--dedupe",
             "--max-products",
             "0",
-        ]
+            "--stream-raw-db",
+            "--raw-schema",
+            config_value("RAW_SCHEMA", "raw"),
+            "--load-id",
+            load_id,
+            "--raw-table",
+            "fdrive_oils",
+            "--create-database",
+            "--maintenance-database",
+            config_value("MARKETPLACE_MAINTENANCE_DATABASE", "postgres"),
+        ],
+        extra_env=raw_env,
     )
     normalize_source("fdrive")
 
@@ -255,7 +303,7 @@ def load_raw_to_new_database() -> str:
         DATA_DIR,
         config_value("RAW_SCHEMA", "raw"),
         postgres_config_for_new_database(),
-        load_id=str(uuid.uuid4()),
+        load_id=current_load_id(),
         strict=True,
         tables=RAW_TABLES,
         create_database=True,
