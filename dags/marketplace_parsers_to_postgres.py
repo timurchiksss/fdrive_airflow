@@ -355,6 +355,105 @@ def clean_raw_to_cleanned() -> None:
     )
 
 
+def validate_cleaned_quality() -> None:
+    import psycopg2
+
+    config = postgres_config_for_new_database()
+    clean_schema = config_value("CLEAN_SCHEMA", "cleanned")
+    load_id = current_load_id()
+    min_name_pct = float(config_value("QUALITY_MIN_NORMALIZED_NAME_PCT", "0.95"))
+    min_source_id_pct = float(config_value("QUALITY_MIN_SOURCE_ID_PCT", "0.99"))
+    failures = []
+    total_rows = 0
+
+    with psycopg2.connect(
+        host=config.host,
+        port=config.port,
+        user=config.user,
+        password=config.password,
+        dbname=config.database,
+    ) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = %s
+                  AND table_type = 'BASE TABLE'
+                ORDER BY table_name
+                """,
+                (clean_schema,),
+            )
+            tables = [row[0] for row in cur.fetchall()]
+
+            for table in tables:
+                cur.execute(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = %s AND table_name = %s
+                    """,
+                    (clean_schema, table),
+                )
+                columns = {row[0] for row in cur.fetchall()}
+                if "load_id" not in columns:
+                    continue
+
+                cur.execute(
+                    f"SELECT COUNT(*) FROM {q_ident(clean_schema)}.{q_ident(table)} WHERE load_id = %s",
+                    (load_id,),
+                )
+                rows = cur.fetchone()[0]
+                total_rows += rows
+                if rows == 0:
+                    print(f"[quality][{table}] no rows for current load_id", flush=True)
+                    continue
+
+                print(f"[quality][{table}] rows={rows}", flush=True)
+                checks = {
+                    "normalized_name": min_name_pct,
+                    "source_product_id": min_source_id_pct,
+                }
+                for column, threshold in checks.items():
+                    if column not in columns:
+                        failures.append(f"{table}.{column} is missing")
+                        continue
+                    cur.execute(
+                        f"""
+                        SELECT COUNT(*)
+                        FROM {q_ident(clean_schema)}.{q_ident(table)}
+                        WHERE load_id = %s
+                          AND NULLIF(TRIM({q_ident(column)}::text), '') IS NOT NULL
+                        """,
+                        (load_id,),
+                    )
+                    filled = cur.fetchone()[0]
+                    coverage = filled / rows if rows else 0
+                    print(f"[quality][{table}] {column} coverage={coverage:.1%}", flush=True)
+                    if coverage < threshold:
+                        failures.append(f"{table}.{column} coverage {coverage:.1%} < {threshold:.1%}")
+
+                for column in ("brand", "price", "image_url"):
+                    if column not in columns:
+                        continue
+                    cur.execute(
+                        f"""
+                        SELECT COUNT(*)
+                        FROM {q_ident(clean_schema)}.{q_ident(table)}
+                        WHERE load_id = %s
+                          AND NULLIF(TRIM({q_ident(column)}::text), '') IS NOT NULL
+                        """,
+                        (load_id,),
+                    )
+                    filled = cur.fetchone()[0]
+                    print(f"[quality][{table}] {column} coverage={filled / rows:.1%}", flush=True)
+
+    if total_rows == 0:
+        failures.append(f"No cleaned rows for current load_id={load_id}")
+    if failures:
+        raise RuntimeError("Cleaned quality gate failed: " + "; ".join(failures))
+
+
 def ensure_matching_schema() -> None:
     import psycopg2
 
@@ -422,6 +521,82 @@ def run_matching_pipeline() -> None:
     )
 
 
+def run_build_matching_catalog_tables() -> None:
+    run_cmd(
+        [
+            sys.executable,
+            str(SCRIPTS_DIR / "build_matching_catalog_tables.py"),
+            "--clean-schema",
+            config_value("CLEAN_SCHEMA", "cleanned"),
+            "--match-schema",
+            config_value("MATCH_SCHEMA", "matching"),
+        ],
+        extra_env=matching_postgres_env(postgres_config_for_new_database()),
+    )
+
+
+def validate_matching_quality() -> None:
+    import psycopg2
+
+    config = postgres_config_for_new_database()
+    schema = config_value("MATCH_SCHEMA", "matching")
+    min_multi_source_pct = float(config_value("QUALITY_MIN_MULTI_SOURCE_PCT", "0.005"))
+    failures = []
+
+    with psycopg2.connect(
+        host=config.host,
+        port=config.port,
+        user=config.user,
+        password=config.password,
+        dbname=config.database,
+    ) as conn:
+        with conn.cursor() as cur:
+            for table in ("categories", "skus", "sku_source_mapping", "attributes", "attribute_groups", "category_attributes", "sku_attribute_values", "sku_price_history"):
+                cur.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM information_schema.tables
+                        WHERE table_schema = %s AND table_name = %s
+                    )
+                    """,
+                    (schema, table),
+                )
+                if not cur.fetchone()[0]:
+                    failures.append(f"{schema}.{table} is missing")
+                    continue
+                cur.execute(f"SELECT COUNT(*) FROM {q_ident(schema)}.{q_ident(table)}")
+                count = cur.fetchone()[0]
+                print(f"[quality][{schema}.{table}] rows={count}", flush=True)
+                if table in {"categories", "skus", "sku_source_mapping", "attributes", "attribute_groups"} and count == 0:
+                    failures.append(f"{schema}.{table} is empty")
+
+            cur.execute(
+                f"""
+                SELECT
+                    COUNT(*) AS sku_count,
+                    COUNT(*) FILTER (
+                        WHERE jsonb_typeof(source_id) = 'array'
+                          AND jsonb_array_length(source_id) > 1
+                    ) AS multi_source_count
+                FROM {q_ident(schema)}.skus
+                """
+            )
+            sku_count, multi_source_count = cur.fetchone()
+            multi_source_pct = multi_source_count / sku_count if sku_count else 0
+            print(
+                f"[quality][matching] multi_source={multi_source_count}/{sku_count} ({multi_source_pct:.2%})",
+                flush=True,
+            )
+            if sku_count and multi_source_pct < min_multi_source_pct:
+                failures.append(
+                    f"multi-source SKU coverage {multi_source_pct:.2%} < {min_multi_source_pct:.2%}"
+                )
+
+    if failures:
+        raise RuntimeError("Matching quality gate failed: " + "; ".join(failures))
+
+
 default_args = {
     "owner": "fdrive",
     "retries": 2,
@@ -467,6 +642,11 @@ with DAG(
         python_callable=clean_raw_to_cleanned,
         execution_timeout=timedelta(hours=4),
     )
+    validate_cleaned = PythonOperator(
+        task_id="validate_cleaned_quality",
+        python_callable=validate_cleaned_quality,
+        execution_timeout=timedelta(minutes=20),
+    )
     create_matching_schema = PythonOperator(
         task_id="create_matching_schema",
         python_callable=ensure_matching_schema,
@@ -489,6 +669,16 @@ with DAG(
         execution_timeout=timedelta(hours=6),
         trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
     )
+    build_catalog_tables = PythonOperator(
+        task_id="build_matching_catalog_tables",
+        python_callable=run_build_matching_catalog_tables,
+        execution_timeout=timedelta(hours=2),
+    )
+    validate_matching = PythonOperator(
+        task_id="validate_matching_quality",
+        python_callable=validate_matching_quality,
+        execution_timeout=timedelta(minutes=20),
+    )
 
     end = EmptyOperator(task_id="end")
 
@@ -497,8 +687,8 @@ with DAG(
         parse_carcity_task,
         parse_forte_task,
         parse_satu_task,
-    ] >> clean_to_cleanned >> create_matching_schema >> choose_matching_path
+    ] >> clean_to_cleanned >> validate_cleaned >> create_matching_schema >> choose_matching_path
 
     choose_matching_path >> categories_already_exist >> run_matching
     choose_matching_path >> ensure_categories_task >> run_matching
-    run_matching >> end
+    run_matching >> build_catalog_tables >> validate_matching >> end
