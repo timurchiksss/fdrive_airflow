@@ -575,6 +575,7 @@ def main() -> int:
     parser.add_argument("--raw-table", default="", help="Имя raw-таблицы. По умолчанию fdrive_tires/fdrive_oils.")
     parser.add_argument("--create-database", action="store_true", help="Создать БД перед streaming insert, если ее нет.")
     parser.add_argument("--maintenance-database", default="postgres")
+    parser.add_argument("--no-csv", action="store_true", help="Не сохранять результат в CSV.")
     args = parser.parse_args()
 
     csv_path = Path(args.out or safe_output_name(args.url))
@@ -622,14 +623,17 @@ def main() -> int:
             raw_writer.close()
     if not rows:
         print("Товары не найдены.", file=sys.stderr)
-        save_empty_csv(csv_path, group)
-        print(f"Пустой CSV с заголовком: {csv_path.resolve()}")
+        if not args.no_csv:
+            save_empty_csv(csv_path, group)
+            print(f"Пустой CSV с заголовком: {csv_path.resolve()}")
         return 0
 
-    save_csv(rows, csv_path)
+    if not args.no_csv:
+        save_csv(rows, csv_path)
 
     print(f"Готово: {len(rows)} товаров")
-    print(f"CSV:   {csv_path.resolve()}")
+    if not args.no_csv:
+        print(f"CSV:   {csv_path.resolve()}")
     return 0
 
 

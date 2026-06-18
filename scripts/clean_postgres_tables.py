@@ -135,8 +135,11 @@ def list_tables(cur, schema: str) -> list[str]:
     return [row[0] for row in cur.fetchall()]
 
 
-def read_table(conn, schema: str, table: str) -> pd.DataFrame:
+def read_table(conn, schema: str, table: str, load_id: str | None = None) -> pd.DataFrame:
     sql = f"SELECT * FROM {q_ident(schema)}.{q_ident(table)}"
+    if load_id:
+        sql += " WHERE load_id = %s"
+        return pd.read_sql_query(sql, conn, params=(load_id,))
     return pd.read_sql_query(sql, conn)
 
 
@@ -287,17 +290,20 @@ def clean_database(
     clean_schema: str,
     tables: list[str] | None = None,
     config: PostgresConfig | None = None,
+    load_id: str | None = None,
 ) -> None:
     with connect(config or config_from_env()) as conn:
         with conn.cursor() as cur:
             raw_tables = tables or list_tables(cur, raw_schema)
             print(f"raw schema: {raw_schema}")
             print(f"clean schema: {clean_schema}")
+            if load_id:
+                print(f"load_id filter: {load_id}")
             print(f"tables to clean: {len(raw_tables)}")
 
             cleaned_tables = set()
             for table in raw_tables:
-                raw_df = read_table(conn, raw_schema, table)
+                raw_df = read_table(conn, raw_schema, table, load_id=load_id)
                 print(f"\n[{table}] raw rows={len(raw_df)}, columns={len(raw_df.columns)}", flush=True)
                 clean_df = clean_table(raw_df, table)
                 print(f"[{table}] clean rows={len(clean_df)}, columns={len(clean_df.columns)}", flush=True)
@@ -317,10 +323,11 @@ def main() -> int:
     parser.add_argument("--raw-schema", default=os.environ.get("RAW_SCHEMA", "raw"))
     parser.add_argument("--clean-schema", default=os.environ.get("CLEAN_SCHEMA", "cleanned"))
     parser.add_argument("--tables", default="", help="Comma-separated raw table names. Empty means all raw tables.")
+    parser.add_argument("--load-id", default=os.environ.get("LOAD_ID", ""))
     args = parser.parse_args()
 
     tables = [item.strip() for item in args.tables.split(",") if item.strip()] or None
-    clean_database(args.raw_schema, args.clean_schema, tables=tables)
+    clean_database(args.raw_schema, args.clean_schema, tables=tables, load_id=args.load_id or None)
     return 0
 
 

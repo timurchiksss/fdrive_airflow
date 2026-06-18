@@ -30,6 +30,7 @@ import json
 import logging
 import re
 import sqlite3
+import sys
 import threading
 import time
 from collections import defaultdict
@@ -1689,6 +1690,81 @@ class CategoryCsvWriter:
             file.close()
 
 
+class CategoryRawWriter:
+    """Batch writer for canonical Carcity rows into raw Postgres."""
+
+    def __init__(
+        self,
+        groups: Iterable[str],
+        *,
+        schema: str,
+        load_id: str,
+        create_database: bool = False,
+        maintenance_database: str = "postgres",
+        batch_size: int = 500,
+    ) -> None:
+        scripts_dir = Path(__file__).resolve().parents[1] / "scripts"
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        from normalize_catalog_csvs import CANONICALIZERS, SCHEMAS  # noqa: PLC0415
+        from streaming_raw_writer import StreamingRawWriter  # noqa: PLC0415
+
+        self.schema = schema
+        self.load_id = load_id
+        self.batch_size = batch_size
+        self.canonicalizers = CANONICALIZERS
+        self.columns_by_group = SCHEMAS
+        self.writer = StreamingRawWriter.from_env(
+            schema=schema,
+            load_id=load_id,
+            source_file="carcity_stream",
+            create_database=create_database,
+            maintenance_database=maintenance_database,
+        )
+        selected_groups = [group for group in CATEGORY_GROUPS if group in set(groups)]
+        self.rows_by_group = {group: 0 for group in selected_groups}
+        self.rows_written = 0
+        self.pending: dict[str, list[dict[str, Any]]] = {group: [] for group in selected_groups}
+
+    def write(self, product: Product) -> None:
+        group = product.category_group
+        if group not in self.pending:
+            progress(
+                f"Пропускаю товар {product.source_product_id}: "
+                f"неизвестная группа {group!r}"
+            )
+            return
+        row = self.canonicalizers[group](product.output_row(), "carcity")
+        self.pending[group].append(row)
+        self.rows_by_group[group] += 1
+        self.rows_written += 1
+        if len(self.pending[group]) >= self.batch_size:
+            self.flush_group(group)
+
+    def flush_group(self, group: str) -> None:
+        rows = self.pending.get(group) or []
+        if not rows:
+            return
+        table = f"carcity_{group}"
+        written = self.writer.write_rows(table, rows, self.columns_by_group[group])
+        print(f"[raw-db] {self.schema}.{table}: +{written}, load_id={self.load_id}", flush=True)
+        self.pending[group] = []
+
+    def flush(self) -> None:
+        for group in list(self.pending):
+            self.flush_group(group)
+
+    def output_files(self) -> dict[str, str]:
+        return {}
+
+    def __enter__(self) -> "CategoryRawWriter":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.flush()
+        self.writer.close()
+
+
 class PriceHistoryWriter:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -1738,6 +1814,19 @@ class PriceHistoryWriter:
 
     def __exit__(self, *_: object) -> None:
         self.file.close()
+
+
+class NullPriceHistoryWriter:
+    rows_written = 0
+
+    def write(self, product: Product) -> None:
+        return
+
+    def __enter__(self) -> "NullPriceHistoryWriter":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return
 
 
 class State:
@@ -1851,6 +1940,11 @@ def run_carcity_parser(
     resume: bool = False,
     state_path: str | Path | None = None,
     respect_robots: bool = True,
+    stream_raw_db: bool = False,
+    raw_schema: str = "raw",
+    load_id: str = "",
+    create_database: bool = False,
+    maintenance_database: str = "postgres",
 ) -> dict[str, object]:
     """Запустить Carcity и вернуть JSON-совместимую сводку.
 
@@ -1952,13 +2046,26 @@ def run_carcity_parser(
         else:
             progress(f"Начинаю разбор {len(items)} карточек в {workers} потоков")
 
-        with (
-            CategoryCsvWriter(
+        product_writer_context = (
+            CategoryRawWriter(
+                selected_groups,
+                schema=raw_schema,
+                load_id=load_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+                create_database=create_database,
+                maintenance_database=maintenance_database,
+            )
+            if stream_raw_db
+            else CategoryCsvWriter(
                 output_path,
                 selected_groups,
                 append=resume,
-            ) as csv_writer,
-            PriceHistoryWriter(history_path) as history_writer,
+            )
+        )
+        history_writer_context = NullPriceHistoryWriter() if stream_raw_db else PriceHistoryWriter(history_path)
+
+        with (
+            product_writer_context as product_writer,
+            history_writer_context as history_writer,
             ThreadPoolExecutor(max_workers=workers) as pool,
         ):
             futures = {
@@ -1979,7 +2086,7 @@ def run_carcity_parser(
                     continue
                 processed += 1
                 if product is not None:
-                    csv_writer.write(product)
+                    product_writer.write(product)
                     status = state.record(product)
                     if status in ("new", "changed"):
                         history_writer.write(product)
@@ -1992,7 +2099,7 @@ def run_carcity_parser(
                 if completed <= 10 or completed % 50 == 0 or completed == len(items):
                     progress(
                         f"Карточки: {completed}/{len(items)}, "
-                        f"товаров={product_count}, строк CSV={csv_writer.rows_written}, "
+                        f"товаров={product_count}, строк raw={product_writer.rows_written}, "
                         f"ошибок={errors}"
                     )
                 if completed % 200 == 0:
@@ -2009,13 +2116,13 @@ def run_carcity_parser(
                 discovered=discovered,
                 processed=processed,
                 products=product_count,
-                rows_written=csv_writer.rows_written,
-                rows_by_group=dict(csv_writer.rows_by_group),
+                rows_written=product_writer.rows_written,
+                rows_by_group=dict(product_writer.rows_by_group),
                 history_rows_written=history_writer.rows_written,
                 skipped=skipped,
                 errors=errors,
-                output_files=csv_writer.output_files(),
-                history_csv=str(history_path.resolve()),
+                output_files=product_writer.output_files(),
+                history_csv="" if stream_raw_db else str(history_path.resolve()),
                 state_db=str(database_path.resolve()),
                 elapsed_seconds=round(time.monotonic() - started_at, 2),
                 new=state.stats["new"],
@@ -2094,6 +2201,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Не проверять robots.txt.",
     )
+    parser.add_argument("--stream-raw-db", action="store_true", help="Писать товары батчами в raw Postgres вместо CSV.")
+    parser.add_argument("--raw-schema", default="raw")
+    parser.add_argument("--load-id", default="")
+    parser.add_argument("--create-database", action="store_true")
+    parser.add_argument("--maintenance-database", default="postgres")
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser
 
@@ -2121,6 +2233,11 @@ def main() -> int:
             resume=args.resume,
             state_path=args.state or None,
             respect_robots=not args.no_robots,
+            stream_raw_db=args.stream_raw_db,
+            raw_schema=args.raw_schema,
+            load_id=args.load_id,
+            create_database=args.create_database,
+            maintenance_database=args.maintenance_database,
         )
     except (ValueError, requests.RequestException) as exc:
         log.error("%s", exc)
@@ -2130,7 +2247,7 @@ def main() -> int:
     print(f"Найдено товаров : {summary['discovered']}")
     print(f"Обработано       : {summary['processed']}")
     print(f"Товаров записано: {summary['products']}")
-    print(f"Строк в CSV      : {summary['rows_written']}")
+    print(f"Строк raw        : {summary['rows_written']}")
     print(
         "По таблицам       : "
         + ", ".join(
@@ -2141,7 +2258,8 @@ def main() -> int:
     print(f"Ошибок           : {summary['errors']}")
     for group, path in summary["output_files"].items():
         print(f"CSV {group:<10}: {path}")
-    print(f"История цен      : {summary['history_csv']}")
+    if summary["history_csv"]:
+        print(f"История цен      : {summary['history_csv']}")
     print(f"Время            : {summary['elapsed_seconds']} с")
     return 0 if summary["products"] else 1
 

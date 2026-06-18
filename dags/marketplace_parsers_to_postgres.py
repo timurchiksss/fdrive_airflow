@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import json
 import os
-import shutil
 import subprocess
 import sys
 import uuid
@@ -43,8 +41,7 @@ RAW_TABLES = {
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from normalize_catalog_csvs import normalize as normalize_catalog_csvs  # noqa: E402
-from raw_postgres_loader import PostgresConfig, load_csvs, q_ident  # noqa: E402
+from raw_postgres_loader import PostgresConfig, q_ident  # noqa: E402
 
 
 def optional_config_value(name: str) -> str | None:
@@ -129,39 +126,6 @@ def matching_postgres_env(config: PostgresConfig) -> dict[str, str]:
     }
 
 
-def normalize_source(source: str) -> None:
-    normalize_catalog_csvs(DATA_DIR, max_rows=0, sources={source})
-
-
-def run_dirs(base_dir: Path) -> set[Path]:
-    return {path for path in base_dir.iterdir() if path.is_dir()}
-
-
-def latest_run_file(base_dir: Path, file_name: str, directories: set[Path]) -> Path:
-    for directory in sorted(directories, key=lambda path: path.name, reverse=True):
-        candidate = directory / file_name
-        if candidate.exists():
-            return candidate
-    raise FileNotFoundError(f"No {file_name} found under {base_dir}")
-
-
-def copy_run_outputs(
-    runs_dir: Path,
-    output_dir: Path,
-    prefix: str,
-    directories: set[Path],
-) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    for group in ["tires", "oils", "filters", "batteries"]:
-        source = latest_run_file(runs_dir, f"{prefix}_{group}.csv", directories)
-        shutil.copy2(source, output_dir / source.name)
-
-    summary_path = latest_run_file(runs_dir, "run_summary.json", directories)
-    summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    if not summary.get("completed"):
-        raise RuntimeError(f"{prefix} parser did not complete: {summary}")
-
-
 def parse_fdrive() -> None:
     load_id = current_load_id()
     postgres_config = postgres_config_for_new_database()
@@ -191,6 +155,7 @@ def parse_fdrive() -> None:
             "--create-database",
             "--maintenance-database",
             config_value("MARKETPLACE_MAINTENANCE_DATABASE", "postgres"),
+            "--no-csv",
         ],
         extra_env=raw_env,
     )
@@ -214,6 +179,7 @@ def parse_fdrive() -> None:
             "--create-database",
             "--maintenance-database",
             config_value("MARKETPLACE_MAINTENANCE_DATABASE", "postgres"),
+            "--no-csv",
         ],
         extra_env=raw_env,
     )
@@ -239,13 +205,15 @@ def parse_fdrive() -> None:
             "--create-database",
             "--maintenance-database",
             config_value("MARKETPLACE_MAINTENANCE_DATABASE", "postgres"),
+            "--no-csv",
         ],
         extra_env=raw_env,
     )
-    normalize_source("fdrive")
 
 
 def parse_carcity() -> None:
+    load_id = current_load_id()
+    postgres_config = postgres_config_for_new_database()
     args = [
         sys.executable,
         str(PARSERS_DIR / "carcity.py"),
@@ -255,17 +223,25 @@ def parse_carcity() -> None:
         config_value("CARCITY_WORKERS", config_value("PARSER_WORKERS", "6")),
         "--output-dir",
         str(DATA_DIR / "carcity"),
+        "--stream-raw-db",
+        "--raw-schema",
+        config_value("RAW_SCHEMA", "raw"),
+        "--load-id",
+        load_id,
+        "--create-database",
+        "--maintenance-database",
+        config_value("MARKETPLACE_MAINTENANCE_DATABASE", "postgres"),
     ]
     if env_flag("CARCITY_NO_ROBOTS", True):
         args.append("--no-robots")
-    run_cmd(args)
-    normalize_source("carcity")
+    run_cmd(args, extra_env=raw_postgres_env(postgres_config))
 
 
 def parse_satu() -> None:
+    load_id = current_load_id()
+    postgres_config = postgres_config_for_new_database()
     runs_dir = DATA_DIR / "_runs" / "satu"
     runs_dir.mkdir(parents=True, exist_ok=True)
-    before_dirs = run_dirs(runs_dir)
     args = [
         sys.executable,
         str(PARSERS_DIR / "satu_parser.py"),
@@ -279,21 +255,25 @@ def parse_satu() -> None:
         config_value("SATU_WORKERS", config_value("PARSER_WORKERS", "6")),
         "--output-dir",
         str(runs_dir),
+        "--stream-raw-db",
+        "--raw-schema",
+        config_value("RAW_SCHEMA", "raw"),
+        "--load-id",
+        load_id,
+        "--create-database",
+        "--maintenance-database",
+        config_value("MARKETPLACE_MAINTENANCE_DATABASE", "postgres"),
     ]
     if env_flag("SATU_SKIP_DETAILS"):
         args.append("--skip-details")
-    run_cmd(args)
-    new_dirs = run_dirs(runs_dir) - before_dirs
-    if not new_dirs:
-        raise RuntimeError("Satu parser did not create a run directory.")
-    copy_run_outputs(runs_dir, DATA_DIR / "satu", "satu", new_dirs)
-    normalize_source("satu")
+    run_cmd(args, extra_env=raw_postgres_env(postgres_config))
 
 
 def parse_forte_market() -> None:
+    load_id = current_load_id()
+    postgres_config = postgres_config_for_new_database()
     runs_dir = DATA_DIR / "_runs" / "forte_market"
     runs_dir.mkdir(parents=True, exist_ok=True)
-    before_dirs = run_dirs(runs_dir)
     args = [
         sys.executable,
         str(PARSERS_DIR / "forte_market_parser.py"),
@@ -305,15 +285,18 @@ def parse_forte_market() -> None:
         config_value("FORTE_WORKERS", config_value("PARSER_WORKERS", "6")),
         "--output-dir",
         str(runs_dir),
+        "--stream-raw-db",
+        "--raw-schema",
+        config_value("RAW_SCHEMA", "raw"),
+        "--load-id",
+        load_id,
+        "--create-database",
+        "--maintenance-database",
+        config_value("MARKETPLACE_MAINTENANCE_DATABASE", "postgres"),
     ]
     if env_flag("FORTE_SKIP_DETAILS"):
         args.append("--skip-details")
-    run_cmd(args)
-    new_dirs = run_dirs(runs_dir) - before_dirs
-    if not new_dirs:
-        raise RuntimeError("Forte parser did not create a run directory.")
-    copy_run_outputs(runs_dir, DATA_DIR / "forte_market", "forte", new_dirs)
-    normalize_source("forte_market")
+    run_cmd(args, extra_env=raw_postgres_env(postgres_config))
 
 
 def postgres_config_for_new_database() -> PostgresConfig:
@@ -330,19 +313,6 @@ def postgres_config_for_new_database() -> PostgresConfig:
             "MARKETPLACE_PGDATABASE",
             config_value("RAW_PGDATABASE", config_value("PGDATABASE", "fdrive")),
         ),
-    )
-
-
-def load_raw_to_new_database() -> str:
-    return load_csvs(
-        DATA_DIR,
-        config_value("RAW_SCHEMA", "raw"),
-        postgres_config_for_new_database(),
-        load_id=current_load_id(),
-        strict=True,
-        tables=RAW_TABLES,
-        create_database=True,
-        maintenance_database=config_value("MARKETPLACE_MAINTENANCE_DATABASE", "postgres"),
     )
 
 
@@ -381,6 +351,7 @@ def clean_raw_to_cleanned() -> None:
         config_value("CLEAN_SCHEMA", "cleanned"),
         tables=tables_to_clean,
         config=config,
+        load_id=current_load_id(),
     )
 
 
@@ -491,11 +462,6 @@ with DAG(
         execution_timeout=timedelta(hours=24),
     )
 
-    load_raw = PythonOperator(
-        task_id="load_raw",
-        python_callable=load_raw_to_new_database,
-        execution_timeout=timedelta(hours=4),
-    )
     clean_to_cleanned = PythonOperator(
         task_id="clean_to_cleanned",
         python_callable=clean_raw_to_cleanned,
@@ -531,7 +497,7 @@ with DAG(
         parse_carcity_task,
         parse_forte_task,
         parse_satu_task,
-    ] >> load_raw >> clean_to_cleanned >> create_matching_schema >> choose_matching_path
+    ] >> clean_to_cleanned >> create_matching_schema >> choose_matching_path
 
     choose_matching_path >> categories_already_exist >> run_matching
     choose_matching_path >> ensure_categories_task >> run_matching

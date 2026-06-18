@@ -1118,18 +1118,52 @@ def write_outputs(
     finished_at: str,
     completed: bool,
     error: str,
+    *,
+    stream_raw_db: bool = False,
+    raw_schema: str = "raw",
+    load_id: str = "",
+    create_database: bool = False,
+    maintenance_database: str = "postgres",
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     output_counts: dict[str, int] = {}
-    for category_id, rule in CORE_AUTO_CATEGORY_RULES.items():
-        output_key = "oils" if rule["key"] == "motor_oils" else rule["key"]
-        rows = [row for row in state.flat_products if row.get("category_id") == category_id]
-        output_counts[output_key] = write_csv(
-            out_dir / f"forte_{output_key}.csv",
-            (output_row(row, output_key) for row in rows),
-            GROUP_OUTPUT_COLUMNS[output_key],
+    if stream_raw_db:
+        scripts_dir = Path(__file__).resolve().parents[1] / "scripts"
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        from normalize_catalog_csvs import CANONICALIZERS, SCHEMAS  # noqa: PLC0415
+        from streaming_raw_writer import StreamingRawWriter  # noqa: PLC0415
+
+        writer = StreamingRawWriter.from_env(
+            schema=raw_schema,
+            load_id=load_id or now_utc(),
+            source_file="forte_market_stream",
+            create_database=create_database,
+            maintenance_database=maintenance_database,
         )
+        try:
+            for category_id, rule in CORE_AUTO_CATEGORY_RULES.items():
+                output_key = "oils" if rule["key"] == "motor_oils" else rule["key"]
+                rows = [row for row in state.flat_products if row.get("category_id") == category_id]
+                canonical_rows = [
+                    CANONICALIZERS[output_key](output_row(row, output_key), "forte_market")
+                    for row in rows
+                ]
+                table = f"forte_market_{output_key}"
+                output_counts[output_key] = writer.write_rows(table, canonical_rows, SCHEMAS[output_key])
+                print(f"[raw-db] {raw_schema}.{table}: +{output_counts[output_key]}, load_id={writer.load_id}", flush=True)
+        finally:
+            writer.close()
+    else:
+        for category_id, rule in CORE_AUTO_CATEGORY_RULES.items():
+            output_key = "oils" if rule["key"] == "motor_oils" else rule["key"]
+            rows = [row for row in state.flat_products if row.get("category_id") == category_id]
+            output_counts[output_key] = write_csv(
+                out_dir / f"forte_{output_key}.csv",
+                (output_row(row, output_key) for row in rows),
+                GROUP_OUTPUT_COLUMNS[output_key],
+            )
 
     summary = {
         "source": SOURCE,
@@ -1179,6 +1213,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retries", type=int, default=5, help="Retries for transient API errors.")
     parser.add_argument("--retry-sleep", type=float, default=5.0, help="Initial retry sleep in seconds.")
     parser.add_argument("--skip-details", action="store_true", help="Only parse listing data; faster but fewer attrs.")
+    parser.add_argument("--stream-raw-db", action="store_true", help="Write canonical rows into raw Postgres instead of CSV.")
+    parser.add_argument("--raw-schema", default="raw")
+    parser.add_argument("--load-id", default="")
+    parser.add_argument("--create-database", action="store_true")
+    parser.add_argument("--maintenance-database", default="postgres")
     return parser.parse_args()
 
 
@@ -1313,7 +1352,20 @@ def main() -> int:
         raise
     finally:
         finished_at = now_utc()
-        write_outputs(out_dir, state, raw_count, started_at, finished_at, completed, error_message)
+        write_outputs(
+            out_dir,
+            state,
+            raw_count,
+            started_at,
+            finished_at,
+            completed,
+            error_message,
+            stream_raw_db=args.stream_raw_db,
+            raw_schema=args.raw_schema,
+            load_id=args.load_id,
+            create_database=args.create_database,
+            maintenance_database=args.maintenance_database,
+        )
         print(f"[forte] Результаты: {out_dir}", flush=True)
 
     return 0
