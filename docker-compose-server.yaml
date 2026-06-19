@@ -4,7 +4,7 @@ x-airflow-common: &airflow-common
     dockerfile: Dockerfile.server
   environment:
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:scSD6QCahyMhCsdxyW10@fdrivedataairflow-fdrive-ucfmoa:5432/fdrive
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: ${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN:?Set AIRFLOW__DATABASE__SQL_ALCHEMY_CONN}
     AIRFLOW__CORE__FERNET_KEY: ""
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
@@ -15,12 +15,12 @@ x-airflow-common: &airflow-common
     RAW_PGHOST: ${RAW_PGHOST:-fdrivedataairflow-fdrive-ucfmoa}
     RAW_PGPORT: ${RAW_PGPORT:-5432}
     RAW_PGUSER: ${RAW_PGUSER:-postgres}
-    RAW_PGPASSWORD: ${RAW_PGPASSWORD:-scSD6QCahyMhCsdxyW10}
+    RAW_PGPASSWORD: ${RAW_PGPASSWORD:?Set RAW_PGPASSWORD}
     RAW_PGDATABASE: ${RAW_PGDATABASE:-fdrive}
     PGHOST: ${PGHOST:-fdrivedataairflow-fdrive-ucfmoa}
     PGPORT: ${PGPORT:-5432}
     PGUSER: ${PGUSER:-postgres}
-    PGPASSWORD: ${PGPASSWORD:-scSD6QCahyMhCsdxyW10}
+    PGPASSWORD: ${PGPASSWORD:?Set PGPASSWORD}
     PGDATABASE: ${PGDATABASE:-fdrive}
     MARKETPLACE_PGDATABASE: ${MARKETPLACE_PGDATABASE:-fdrive}
     MARKETPLACE_MAINTENANCE_DATABASE: ${MARKETPLACE_MAINTENANCE_DATABASE:-postgres}

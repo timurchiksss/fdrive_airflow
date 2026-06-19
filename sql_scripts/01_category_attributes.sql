@@ -1,5 +1,5 @@
 -- ============================================================================
---  §4.5  master.category_attributes — допустимые атрибуты по категориям.
+--  §4.5  matching.category_attributes — допустимые атрибуты по категориям.
 --  Часть Madi. Декларативно по семействам: семейство категории = её предок
 --  2-го уровня в дереве (2=oils, 30=tires, 50=batteries, 60=filters).
 --  Атрибут -> семейство: то семейство, в чьём источнике cleanned.* есть колонка
@@ -7,10 +7,10 @@
 --  Без temp-таблиц (только CTE) — безопасно для Airflow/autocommit.
 --  Идемпотентно: DROP ... CASCADE + пересоздание.
 -- ============================================================================
-SET search_path = master, public;
+SET search_path = matching, public;
 
-DROP TABLE IF EXISTS master.category_attributes CASCADE;
-CREATE TABLE master.category_attributes (
+DROP TABLE IF EXISTS matching.category_attributes CASCADE;
+CREATE TABLE matching.category_attributes (
     category_id        bigint      NOT NULL,
     category           text,
     attribute_group_id smallint,
@@ -19,7 +19,7 @@ CREATE TABLE master.category_attributes (
     attribute          text,
     PRIMARY KEY (category_id, attribute_id));
 
-INSERT INTO master.category_attributes
+INSERT INTO matching.category_attributes
        (category_id, category, attribute_group_id, attribute_group, attribute_id, attribute)
 WITH RECURSIVE
 attr_dom(attr_name, domain) AS (VALUES
@@ -41,10 +41,10 @@ attr_dom(attr_name, domain) AS (VALUES
     ('compatible_model','filters'),('oem_number','filters'),('additional_information','filters'),
     ('image_url','filters')),
 up AS (
-    SELECT category_id, category_id AS anc, level, parent_category_id FROM master.categories
+    SELECT category_id, category_id AS anc, level, parent_category_id FROM matching.categories
     UNION ALL
     SELECT u.category_id, c.category_id, c.level, c.parent_category_id
-    FROM up u JOIN master.categories c ON c.category_id = u.parent_category_id),
+    FROM up u JOIN matching.categories c ON c.category_id = u.parent_category_id),
 cat_dom AS (
     SELECT category_id,
            CASE anc WHEN 2 THEN 'oils' WHEN 30 THEN 'tires'
@@ -53,10 +53,10 @@ cat_dom AS (
 SELECT DISTINCT c.category_id, c.name,
        aag.attribute_group_id, aag.attribute_group, a.id, a.name
 FROM cat_dom d
-JOIN master.categories c ON c.category_id = d.category_id
+JOIN matching.categories c ON c.category_id = d.category_id
 JOIN attr_dom ad         ON ad.domain = d.domain
-JOIN master.attributes a ON a.name = ad.attr_name
-LEFT JOIN master.attributes_attribute_groups aag ON aag.attribute_id = a.id
+JOIN matching.attributes a ON a.name = ad.attr_name
+LEFT JOIN matching.attributes_attribute_groups aag ON aag.attribute_id = a.id
 WHERE d.domain IS NOT NULL;
 
-ANALYZE master.category_attributes;
+ANALYZE matching.category_attributes;

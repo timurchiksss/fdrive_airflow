@@ -11,6 +11,8 @@ assigns each match a leaf `category_id`, and writes `skus` / `sku_source_mapping
 import logging
 import os
 import re
+import uuid
+from itertools import combinations
 
 import pandas as pd
 from sentence_transformers import SentenceTransformer
@@ -43,6 +45,43 @@ TABLE_CONFIG = {
 }
 
 BASE_COLS = ["source", "source_product_id", "product_name", "normalized_name", "brand", "price", "loaded_at"]
+
+UNKNOWN_VALUES = {"", "unknown", "none", "nan", "null", "не указано", "нет данных", "-"}
+
+CANDIDATE_RULES = {
+    "tires": {
+        "block_attrs": ["width_clean", "profile_clean", "diameter_clean"],
+        "score_attrs": ["brand_clean", "width_clean", "profile_clean", "diameter_clean", "season_clean", "speed_index_clean"],
+        "threshold": 0.78,
+        "embedding_weight": 0.45,
+        "rule_weight": 0.55,
+        "match_type": "rules+embeddings",
+    },
+    "oils": {
+        "block_attrs": ["viscosity_clean", "volume_clean"],
+        "score_attrs": ["brand_clean", "viscosity_clean", "volume_clean", "oil_type_clean", "product_line_clean"],
+        "threshold": 0.78,
+        "embedding_weight": 0.45,
+        "rule_weight": 0.55,
+        "match_type": "rules+embeddings",
+    },
+    "filters": {
+        "block_attrs": ["filter_type_clean"],
+        "score_attrs": ["brand_clean", "filter_type_clean", "oem_clean", "article"],
+        "threshold": 0.76,
+        "embedding_weight": 0.40,
+        "rule_weight": 0.60,
+        "match_type": "rules+embeddings",
+    },
+    "batteries": {
+        "block_attrs": ["capacity_clean", "voltage_clean"],
+        "score_attrs": ["brand_clean", "capacity_clean", "voltage_clean", "battery_type_clean", "model_clean"],
+        "threshold": 0.78,
+        "embedding_weight": 0.45,
+        "rule_weight": 0.55,
+        "match_type": "rules+embeddings",
+    },
+}
 
 
 def get_engine() -> Engine:
@@ -409,52 +448,196 @@ def confidence_bucket(score, method):
     return "Low"
 
 
-def find_matches_in_groups(model, data, group_col, threshold, match_type,
-                            require_multi_source=True, exclude_unknown=True,
-                            exclude_substring="unknown", max_group_size=None,
-                            penalty_fn=None, check_brand=False, name_col="name_clean"):
-    """Embed names within each group and pair up cross-merchant matches above threshold."""
+def is_known(value) -> bool:
+    if pd.isna(value):
+        return False
+    return str(value).strip().lower() not in UNKNOWN_VALUES
+
+
+def hard_value(value) -> str:
+    if not is_known(value):
+        return "unknown"
+    text = str(value).strip().lower()
+    text = re.sub(r"\.0$", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def row_block_key(row: pd.Series, category: str, attrs: list[str]) -> tuple[str, ...] | None:
+    values = [category, hard_value(row.get("brand_clean"))]
+    if values[-1] == "unknown":
+        return None
+    for attr in attrs:
+        value = hard_value(row.get(attr))
+        if value == "unknown":
+            return None
+        values.append(value)
+    return tuple(values)
+
+
+def generate_candidates(data: pd.DataFrame, category: str, block_attrs: list[str],
+                        max_block_size: int = 250) -> pd.DataFrame:
+    """Stage 1: deterministic blocking by category + brand + hard attrs."""
+    records = []
+    if data.empty:
+        return pd.DataFrame(records)
+
+    work = data.copy()
+    work["candidate_block_key"] = work.apply(lambda row: row_block_key(row, category, block_attrs), axis=1)
+    work = work[work["candidate_block_key"].notna()]
+
+    for block_key, group in work.groupby("candidate_block_key"):
+        if len(group) < 2 or group["source"].nunique() < 2:
+            continue
+        if len(group) > max_block_size:
+            logger.info("Skip oversized candidate block %s with %s rows", block_key, len(group))
+            continue
+        for left_idx, right_idx in combinations(group.index, 2):
+            left = group.loc[left_idx]
+            right = group.loc[right_idx]
+            if left["source"] == right["source"]:
+                continue
+            records.append({
+                "left_idx": left_idx,
+                "right_idx": right_idx,
+                "sku_1": left["sku_id"],
+                "sku_2": right["sku_id"],
+                "source_1": left["source"],
+                "source_2": right["source"],
+                "category": category,
+                "candidate_block_key": "|".join(map(str, block_key)),
+                "candidate_rule": f"category+brand+{'+'.join(block_attrs)}",
+            })
+    return pd.DataFrame(records).drop_duplicates(subset=["sku_1", "sku_2"])
+
+
+def compare_hard_attrs(left: pd.Series, right: pd.Series, attrs: list[str]) -> tuple[float, dict]:
+    matched = {}
+    mismatched = {}
+    missing = []
+    weighted_score = 0.0
+    total_weight = 0.0
+
+    for attr in attrs:
+        left_value = hard_value(left.get(attr))
+        right_value = hard_value(right.get(attr))
+        if left_value == "unknown" or right_value == "unknown":
+            missing.append(attr)
+            continue
+        weight = 1.5 if attr in {"brand_clean", "width_clean", "profile_clean", "diameter_clean",
+                                  "viscosity_clean", "volume_clean", "capacity_clean", "voltage_clean",
+                                  "oem_clean"} else 1.0
+        total_weight += weight
+        if left_value == right_value:
+            matched[attr] = {"left": left_value, "right": right_value}
+            weighted_score += weight
+        else:
+            mismatched[attr] = {"left": left_value, "right": right_value}
+
+    rule_score = weighted_score / total_weight if total_weight else 0.0
+    explanation = {
+        "matched_fields": matched,
+        "mismatched_fields": mismatched,
+        "missing_fields": missing,
+    }
+    return rule_score, explanation
+
+
+def embedding_scores(model: SentenceTransformer, data: pd.DataFrame, candidate_pairs: pd.DataFrame,
+                     name_col: str = "name_clean") -> dict[str, object]:
+    sku_ids = pd.unique(pd.concat([candidate_pairs["sku_1"], candidate_pairs["sku_2"]], ignore_index=True))
+    names = data.drop_duplicates("sku_id").set_index("sku_id").loc[sku_ids, name_col].fillna("").astype(str)
+    vectors = model.encode(names.tolist(), batch_size=64, show_progress_bar=False)
+    return dict(zip(names.index, vectors))
+
+
+def score_candidates(model: SentenceTransformer, data: pd.DataFrame, candidate_pairs: pd.DataFrame,
+                     *, category: str, score_attrs: list[str], threshold: float,
+                     rule_weight: float, embedding_weight: float, match_type: str,
+                     name_col: str = "name_clean") -> pd.DataFrame:
+    """Stage 2: combine rule score and embedding score, with per-pair explanation."""
+    if candidate_pairs.empty:
+        return pd.DataFrame()
+
+    lookup = data.set_index("sku_id", drop=False)
+    embeddings = embedding_scores(model, data, candidate_pairs, name_col=name_col)
     matches = []
-    for group_key, group in data.groupby(group_col):
-        if len(group) < 2:
-            continue
-        if require_multi_source and group["source"].nunique() < 2:
-            continue
-        if exclude_unknown and exclude_substring in str(group_key):
-            continue
-        if max_group_size and len(group) > max_group_size:
-            continue
 
-        names = group[name_col].tolist()
-        embeddings = model.encode(names, batch_size=64, show_progress_bar=False)
-        sim_matrix = cosine_similarity(embeddings)
+    for _, pair in candidate_pairs.iterrows():
+        left = lookup.loc[pair["sku_1"]]
+        right = lookup.loc[pair["sku_2"]]
+        rule_score, explanation = compare_hard_attrs(left, right, score_attrs)
+        embedding_score = float(cosine_similarity([embeddings[pair["sku_1"]]], [embeddings[pair["sku_2"]]])[0][0])
+        score = rule_score * rule_weight + embedding_score * embedding_weight
 
-        for i in range(len(group)):
-            for j in range(i + 1, len(group)):
-                if group.iloc[i]["source"] == group.iloc[j]["source"]:
-                    continue
+        # A hard mismatch in blocking-critical fields should not pass just because names are close.
+        hard_mismatches = set(explanation["mismatched_fields"])
+        if hard_mismatches & {"brand_clean", "width_clean", "profile_clean", "diameter_clean",
+                              "viscosity_clean", "volume_clean", "capacity_clean", "voltage_clean"}:
+            score *= 0.65
 
-                if check_brand:
-                    brand_i = extract_brand_from_name(group.iloc[i]["normalized_name"])
-                    brand_j = extract_brand_from_name(group.iloc[j]["normalized_name"])
-                    if brand_i != "unknown" and brand_j != "unknown" and brand_i != brand_j:
-                        continue
+        explanation.update({
+            "candidate_generation": {
+                "rule": pair["candidate_rule"],
+                "block_key": pair["candidate_block_key"],
+            },
+            "scoring": {
+                "rule_score": round(rule_score, 3),
+                "embedding_score": round(embedding_score, 3),
+                "rule_weight": rule_weight,
+                "embedding_weight": embedding_weight,
+                "final_score": round(float(score), 3),
+                "threshold": threshold,
+            },
+            "left": {
+                "sku_id": pair["sku_1"],
+                "source": pair["source_1"],
+                "name": left.get("normalized_name"),
+            },
+            "right": {
+                "sku_id": pair["sku_2"],
+                "source": pair["source_2"],
+                "name": right.get("normalized_name"),
+            },
+        })
 
-                score = float(sim_matrix[i][j])
-                if penalty_fn:
-                    score *= penalty_fn(group.iloc[i]["normalized_name"], group.iloc[j]["normalized_name"])
-
-                if score >= threshold:
-                    matches.append({
-                        "sku_1": group.iloc[i]["sku_id"],
-                        "sku_2": group.iloc[j]["sku_id"],
-                        "source_1": group.iloc[i]["source"],
-                        "source_2": group.iloc[j]["source"],
-                        "category": group.iloc[i]["category"],
-                        "score": round(score, 3),
-                        "match_type": match_type,
-                    })
+        if score >= threshold:
+            matches.append({
+                "sku_1": pair["sku_1"],
+                "sku_2": pair["sku_2"],
+                "source_1": pair["source_1"],
+                "source_2": pair["source_2"],
+                "category": category,
+                "score": round(float(score), 3),
+                "rule_score": round(rule_score, 3),
+                "embedding_score": round(embedding_score, 3),
+                "match_type": match_type,
+                "candidate_rule": pair["candidate_rule"],
+                "candidate_block_key": pair["candidate_block_key"],
+                "match_explanation": explanation,
+            })
     return pd.DataFrame(matches)
+
+
+def match_by_candidates(model: SentenceTransformer, data: pd.DataFrame, category: str,
+                        *, name_col: str = "name_clean") -> pd.DataFrame:
+    rules = CANDIDATE_RULES[category]
+    candidates = generate_candidates(data, category, rules["block_attrs"])
+    logger.info("%s candidates: %s", category, len(candidates))
+    results = score_candidates(
+        model,
+        data,
+        candidates,
+        category=category,
+        score_attrs=rules["score_attrs"],
+        threshold=rules["threshold"],
+        rule_weight=rules["rule_weight"],
+        embedding_weight=rules["embedding_weight"],
+        match_type=rules["match_type"],
+        name_col=name_col,
+    )
+    logger.info("%s scored matches: %s", category, len(results))
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -468,7 +651,16 @@ def load_data(engine: Engine) -> pd.DataFrame:
         for table in cfg["tables"]:
             cols = BASE_COLS + cfg["extra_cols"]
             columns_sql = ", ".join(q_ident(col) for col in cols)
-            d = pd.read_sql(f"SELECT {columns_sql} FROM {q_ident(schema)}.{q_ident(table)}", engine)
+            d = pd.read_sql(
+                f"""
+                SELECT DISTINCT ON ({q_ident("source")}, {q_ident("source_product_id")})
+                    {columns_sql}
+                FROM {q_ident(schema)}.{q_ident(table)}
+                ORDER BY {q_ident("source")}, {q_ident("source_product_id")},
+                         {q_ident("loaded_at")} DESC NULLS LAST
+                """,
+                engine,
+            )
             d["category"] = category
             d["sku_id"] = table + ":" + d["source_product_id"].astype(str)
             frames.append(d)
@@ -507,13 +699,7 @@ def match_tires(df: pd.DataFrame, model: SentenceTransformer) -> tuple[pd.DataFr
         tires_df["speed_index_clean"]
     )
 
-    # exclude_substring uses the narrower rule (3 unknown fields in a row) since the extra
-    # width/profile/diameter/speed_index dimensions are frequently unknown on their own
-    tires_results = find_matches_in_groups(
-        model, tires_df, "group_key", threshold=0.75, match_type="NLP",
-        exclude_substring="unknown_unknown_unknown",
-        penalty_fn=lambda n1, n2: number_penalty(n1, n2) * tyre_size_penalty(n1, n2),
-    )
+    tires_results = match_by_candidates(model, tires_df, "tires")
     logger.info("Tire groups: %s | matches: %s", tires_df["group_key"].nunique(), len(tires_results))
     return tires_df, tires_results
 
@@ -543,10 +729,7 @@ def match_oils(df: pd.DataFrame, model: SentenceTransformer) -> tuple[pd.DataFra
         oils_df["viscosity_clean"] + "_" + oils_df["volume_clean"] + "_" + oils_df["oil_type_clean"]
     )
 
-    oils_results = find_matches_in_groups(
-        model, oils_df, "group_key", threshold=0.75, match_type="NLP", exclude_unknown=False,
-        penalty_fn=number_penalty, check_brand=True,
-    )
+    oils_results = match_by_candidates(model, oils_df, "oils")
     logger.info("Oil groups: %s | matches: %s", oils_df["group_key"].nunique(), len(oils_results))
     return oils_df, oils_results
 
@@ -564,7 +747,8 @@ def match_filters(df: pd.DataFrame, model: SentenceTransformer) -> tuple[pd.Data
         filters_df["brand_clean"] + "_" + filters_df["filter_type_clean"] + "_" + filters_df["article"]
     )
 
-    # 1. exact OEM matches
+    # 1. exact OEM matches. This is still explicit candidate generation:
+    # category + exact OEM, with a deterministic high score and explanation.
     oem_matches = []
     oem_df = filters_df[filters_df["oem_clean"] != "unknown"]
     for oem, group in oem_df.groupby("oem_clean"):
@@ -574,20 +758,53 @@ def match_filters(df: pd.DataFrame, model: SentenceTransformer) -> tuple[pd.Data
             for j in range(i + 1, len(group)):
                 if group.iloc[i]["source"] == group.iloc[j]["source"]:
                     continue
+                explanation = {
+                    "candidate_generation": {
+                        "rule": "category+oem_number",
+                        "block_key": f"filters|{oem}",
+                    },
+                    "matched_fields": {
+                        "oem_clean": {"left": oem, "right": oem},
+                    },
+                    "mismatched_fields": {},
+                    "missing_fields": [],
+                    "scoring": {
+                        "rule_score": 1.0,
+                        "embedding_score": None,
+                        "rule_weight": 1.0,
+                        "embedding_weight": 0.0,
+                        "final_score": 1.0,
+                        "threshold": 1.0,
+                    },
+                    "left": {
+                        "sku_id": group.iloc[i]["sku_id"],
+                        "source": group.iloc[i]["source"],
+                        "name": group.iloc[i]["normalized_name"],
+                    },
+                    "right": {
+                        "sku_id": group.iloc[j]["sku_id"],
+                        "source": group.iloc[j]["source"],
+                        "name": group.iloc[j]["normalized_name"],
+                    },
+                }
                 oem_matches.append({
                     "sku_1": group.iloc[i]["sku_id"], "sku_2": group.iloc[j]["sku_id"],
                     "source_1": group.iloc[i]["source"], "source_2": group.iloc[j]["source"],
-                    "category": "filters", "score": 1.0, "match_type": "OEM",
+                    "category": "filters", "score": 1.0, "rule_score": 1.0,
+                    "embedding_score": None, "match_type": "OEM",
+                    "candidate_rule": "category+oem_number",
+                    "candidate_block_key": f"filters|{oem}",
+                    "match_explanation": explanation,
                 })
     oem_results = pd.DataFrame(oem_matches).drop_duplicates(subset=["sku_1", "sku_2"])
 
-    # 2. NLP fallback on brand + filter_type + article (skip huge groups)
-    nlp_results = find_matches_in_groups(model, filters_df, "group_key", threshold=0.75,
-                                          match_type="NLP", max_group_size=30)
+    # 2. Fallback: candidate generation by category + brand + filter type,
+    # scoring by hard attrs + embeddings.
+    nlp_results = match_by_candidates(model, filters_df, "filters")
 
     filters_results = pd.concat([oem_results, nlp_results], ignore_index=True)
     if not filters_results.empty:
-        filters_results = filters_results.drop_duplicates(subset=["sku_1", "sku_2"])
+        filters_results = filters_results.sort_values("score", ascending=False).drop_duplicates(subset=["sku_1", "sku_2"])
     logger.info("Filter OEM matches: %s | NLP matches: %s | total: %s",
                 len(oem_results), len(nlp_results), len(filters_results))
     return filters_df, filters_results
@@ -597,12 +814,14 @@ def match_batteries(df: pd.DataFrame, model: SentenceTransformer) -> tuple[pd.Da
     batteries_df = df[df["category"] == "batteries"].copy()
 
     batteries_df["capacity_clean"] = batteries_df["capacity_ah"].apply(clean_capacity)
+    batteries_df["voltage_clean"] = batteries_df["voltage_v"].apply(clean_capacity)
+    batteries_df["battery_type_clean"] = batteries_df["product_name"].apply(extract_battery_type).fillna("unknown").astype(str).str.lower()
     batteries_df["model_clean"] = batteries_df["name_clean"].apply(extract_battery_model)
     batteries_df["group_key"] = (
         batteries_df["brand_clean"] + "_" + batteries_df["model_clean"] + "_" + batteries_df["capacity_clean"]
     )
 
-    batteries_results = find_matches_in_groups(model, batteries_df, "group_key", threshold=0.75, match_type="NLP")
+    batteries_results = match_by_candidates(model, batteries_df, "batteries")
     logger.info("Battery groups: %s | matches: %s", batteries_df["group_key"].nunique(), len(batteries_results))
     return batteries_df, batteries_results
 
@@ -750,10 +969,11 @@ def build_sku_source_mapping(final_results, all_components, all_group_root, sku_
     pair_info = {}
     for _, r in final_results.iterrows():
         key = frozenset({r["sku_1"], r["sku_2"]})
+        explanation = r.get("match_explanation")
         score, method = r["score"], r["match_type"]
         prev = pair_info.get(key)
         if prev is None or score > prev[0]:
-            pair_info[key] = (score, method)
+            pair_info[key] = (score, method, explanation)
 
     mapping_records = []
     for members in all_components.values():
@@ -764,6 +984,17 @@ def build_sku_source_mapping(final_results, all_components, all_group_root, sku_
             row = products_lookup.loc[m]
             if m == anchor:
                 score, method = 1.0, "root" if len(members) > 1 else "single_source"
+                explanation = {
+                    "matched_fields": {},
+                    "mismatched_fields": {},
+                    "missing_fields": [],
+                    "scoring": {
+                        "rule_score": 1.0,
+                        "embedding_score": None,
+                        "final_score": 1.0,
+                    },
+                    "reason": "component anchor" if len(members) > 1 else "single source product",
+                }
             else:
                 best = None
                 for other in members:
@@ -772,7 +1003,11 @@ def build_sku_source_mapping(final_results, all_components, all_group_root, sku_
                     info = pair_info.get(frozenset({m, other}))
                     if info and (best is None or info[0] > best[0]):
                         best = info
-                score, method = best if best else (0.0, "NLP")
+                if best:
+                    score, method, explanation = best
+                else:
+                    score, method = 0.0, "rules+embeddings"
+                    explanation = {"reason": "no direct pair found inside component"}
 
             mapping_records.append({
                 "sku_id": master_id,
@@ -783,6 +1018,7 @@ def build_sku_source_mapping(final_results, all_components, all_group_root, sku_
                 "match_method": method,
                 "match_score": round(float(score), 3),
                 "match_confidence": confidence_bucket(score, method),
+                "match_explanation": explanation,
             })
 
     sku_source_mapping = pd.DataFrame(mapping_records)
@@ -790,18 +1026,74 @@ def build_sku_source_mapping(final_results, all_components, all_group_root, sku_
     return sku_source_mapping
 
 
-def write_master_tables(engine: Engine, skus_df: pd.DataFrame, sku_source_mapping: pd.DataFrame) -> None:
+def build_match_explanations(final_results: pd.DataFrame) -> pd.DataFrame:
+    if final_results.empty:
+        return pd.DataFrame(
+            columns=[
+                "sku_1", "sku_2", "source_1", "source_2", "category", "score",
+                "rule_score", "embedding_score", "match_type", "candidate_rule",
+                "candidate_block_key", "match_explanation",
+            ]
+        )
+    columns = [
+        "sku_1", "sku_2", "source_1", "source_2", "category", "score",
+        "rule_score", "embedding_score", "match_type", "candidate_rule",
+        "candidate_block_key", "match_explanation",
+    ]
+    present = [column for column in columns if column in final_results.columns]
+    return final_results[present].copy()
+
+
+def write_master_tables(
+    engine: Engine,
+    skus_df: pd.DataFrame,
+    sku_source_mapping: pd.DataFrame,
+    match_explanations: pd.DataFrame,
+) -> None:
     schema = output_schema()
-    with engine.begin() as conn:
-        conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {q_ident(schema)}"))
+    suffix = uuid.uuid4().hex[:12]
+    temp_tables = {
+        "skus": f"_tmp_skus_{suffix}",
+        "sku_source_mapping": f"_tmp_sku_source_mapping_{suffix}",
+        "match_explanations": f"_tmp_match_explanations_{suffix}",
+    }
 
     # source_id is already a list[dict]; let SQLAlchemy's JSONB type serialize it -
     # pre-encoding with json.dumps here would double-encode it into a JSON string column
-    skus_df.to_sql("skus", engine, schema=schema, if_exists="replace", index=False,
+    with engine.begin() as conn:
+        conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {q_ident(schema)}"))
+
+    skus_df.to_sql(temp_tables["skus"], engine, schema=schema, if_exists="replace", index=False,
                     dtype={"source_id": JSONB}, method="multi", chunksize=5000)
-    sku_source_mapping.to_sql("sku_source_mapping", engine, schema=schema, if_exists="replace",
-                               index=False, method="multi", chunksize=5000)
-    logger.info("Saved %s.skus and %s.sku_source_mapping", schema, schema)
+    sku_source_mapping.to_sql(temp_tables["sku_source_mapping"], engine, schema=schema, if_exists="replace",
+                               index=False, method="multi", chunksize=5000,
+                               dtype={"match_explanation": JSONB})
+    match_explanations.to_sql(temp_tables["match_explanations"], engine, schema=schema, if_exists="replace",
+                              index=False, method="multi", chunksize=5000,
+                              dtype={"match_explanation": JSONB})
+
+    with engine.begin() as conn:
+        # Downstream tables have foreign keys to skus/attributes and are rebuilt by the
+        # following DAG tasks. Drop them only after all replacement matching tables exist.
+        for table in [
+            "match_explanations",
+            "sku_attribute_values",
+            "sku_price_history",
+            "sku_source_mapping",
+            "skus",
+        ]:
+            conn.execute(text(f"DROP TABLE IF EXISTS {q_ident(schema)}.{q_ident(table)} CASCADE"))
+        for final_table, temp_table in temp_tables.items():
+            conn.execute(
+                text(
+                    f"ALTER TABLE {q_ident(schema)}.{q_ident(temp_table)} "
+                    f"RENAME TO {q_ident(final_table)}"
+                )
+            )
+    logger.info(
+        "Saved %s.skus, %s.sku_source_mapping and %s.match_explanations",
+        schema, schema, schema,
+    )
 
 
 def run_pipeline(engine: Engine) -> None:
@@ -817,7 +1109,9 @@ def run_pipeline(engine: Engine) -> None:
     final_results = pd.concat(
         [tires_results, oils_results, filters_results, batteries_results],
         ignore_index=True,
-    ).drop_duplicates(subset=["sku_1", "sku_2"])
+    )
+    if not final_results.empty:
+        final_results = final_results.sort_values("score", ascending=False).drop_duplicates(subset=["sku_1", "sku_2"])
     logger.info("Total matches: %s", len(final_results))
 
     root_merchant, sku_source = pick_root_merchant(final_results)
@@ -832,8 +1126,9 @@ def run_pipeline(engine: Engine) -> None:
     sku_source_mapping = build_sku_source_mapping(
         final_results, all_components, all_group_root, sku_id_map, products_lookup
     )
+    match_explanations = build_match_explanations(final_results)
 
-    write_master_tables(engine, skus_df, sku_source_mapping)
+    write_master_tables(engine, skus_df, sku_source_mapping, match_explanations)
 
 
 def main() -> None:

@@ -1,11 +1,11 @@
-CREATE TABLE master.attributes (
+CREATE TABLE matching.attributes (
 	id VARCHAR(20) PRIMARY KEY,
 	name VARCHAR(100),
 	unit VARCHAR(100), 
 	status VARCHAR(20)
 );
 
-INSERT INTO master.attributes (id, name, unit, status) 
+INSERT INTO matching.attributes (id, name, unit, status) 
 WITH cols AS (
     SELECT DISTINCT
         column_name AS name,
@@ -21,7 +21,7 @@ SELECT
 FROM cols
 ORDER BY name;
 
-DELETE FROM master.attributes
+DELETE FROM matching.attributes
 WHERE name IN (
     'load_id',
     'loaded_at',
@@ -37,7 +37,7 @@ WHERE name IN (
     
 );
 
-DELETE FROM master.attributes 
+DELETE FROM matching.attributes 
 WHERE name IN (
 	'category_group', 
 	'price', 
@@ -56,9 +56,9 @@ WITH ordered AS (
     SELECT
         ctid,
         ROW_NUMBER() OVER (ORDER BY name) AS rn
-    FROM master.attributes
+    FROM matching.attributes
 )
-UPDATE master.attributes a 
+UPDATE matching.attributes a 
 SET id = 'main_' || LPAD(ordered.rn::text, 3, '0')
 FROM ordered
 WHERE a.ctid = ordered.ctid;
@@ -66,13 +66,13 @@ WHERE a.ctid = ordered.ctid;
 
 
 
-CREATE TABLE master.attribute_groups (
+CREATE TABLE matching.attribute_groups (
 	id INTEGER primary key, 
 	name VARCHAR(100), 
 	status VARCHAR(20)
 );
 
-INSERT INTO master.attribute_groups (id, name, status)
+INSERT INTO matching.attribute_groups (id, name, status)
 VALUES 
 	(1, 'Основные', 'active'), 
 	(2, 'Технические характеристики', 'active'),
@@ -83,7 +83,7 @@ VALUES
 
 
 
-CREATE TABLE master.attributes_attribute_groups (
+CREATE TABLE matching.attributes_attribute_groups (
     attribute_group_id  INTEGER,
     attribute_group     VARCHAR(100),
     attribute_id        VARCHAR(20),
@@ -91,7 +91,7 @@ CREATE TABLE master.attributes_attribute_groups (
 );
 
 
-INSERT INTO master.attributes_attribute_groups
+INSERT INTO matching.attributes_attribute_groups
     (attribute_group_id, attribute_group, attribute_id, attribute)
 VALUES
   (1, 'Основные', 'main_001',  'brand'),
@@ -132,27 +132,27 @@ VALUES
 
 
 
-ALTER TABLE master.attributes_attribute_groups
+ALTER TABLE matching.attributes_attribute_groups
 ADD CONSTRAINT fk_aag_group
 FOREIGN KEY (attribute_group_id)
-REFERENCES master.attribute_groups(id);
+REFERENCES matching.attribute_groups(id);
 
-ALTER TABLE master.attributes_attribute_groups
+ALTER TABLE matching.attributes_attribute_groups
 ADD CONSTRAINT fk_aag_attribute
 FOREIGN KEY (attribute_id)
-REFERENCES master.attributes(id);
+REFERENCES matching.attributes(id);
 
 
 
 SELECT conname, contype 
 FROM pg_constraint 
-WHERE conrelid = 'master.attributes_attribute_groups'::regclass;
+WHERE conrelid = 'matching.attributes_attribute_groups'::regclass;
 
 
 
-INSERT INTO master.attributes (id, name, unit, status)
+INSERT INTO matching.attributes (id, name, unit, status)
 VALUES ('main_036', 'image_url', 'text', 'active');
 
-INSERT INTO master.attributes_attribute_groups (attribute_group_id, attribute_group, attribute_id, attribute)
+INSERT INTO matching.attributes_attribute_groups (attribute_group_id, attribute_group, attribute_id, attribute)
 VALUES (5, 'Дополнительно', 'main_036', 'image_url');
 

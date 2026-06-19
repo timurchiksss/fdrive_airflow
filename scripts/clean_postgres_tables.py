@@ -96,15 +96,18 @@ BOOLEAN_COLUMNS = {"studded", "runflat"}
 
 AUDIT_COLUMNS = {"source_file", "loaded_at", "load_id"}
 
-TIRE_SIZE_RE = re.compile(r"\b(?P<width>\d{3})\s*/\s*(?P<profile>\d{2,3})\s*(?:ZR|R)?\s*(?P<diameter>\d{2}(?:\.\d)?)\b", re.IGNORECASE)
-TIRE_SPEED_RE = re.compile(r"\b\d{2,3}\s*(?P<speed>[A-ZА-Я])\b", re.IGNORECASE)
-TIRE_LOAD_RE = re.compile(r"\b(?P<load>\d{2,3})\s*/?\s*[A-ZА-Я]\b", re.IGNORECASE)
-VISCOSITY_RE = re.compile(r"\b(?P<visc>\d{1,2}\s*W\s*[-–]?\s*\d{1,2})\b", re.IGNORECASE)
-VOLUME_RE = re.compile(r"\b(?P<value>\d+(?:[,.]\d+)?)\s*(?P<unit>мл|ml|л|l|литр(?:а|ов)?)\b", re.IGNORECASE)
-CAPACITY_RE = re.compile(r"\b(?P<value>\d{2,3})\s*(?:ah|a/h|а/ч|ач|а\.ч)\b", re.IGNORECASE)
-VOLTAGE_RE = re.compile(r"\b(?P<value>6|12|24)\s*(?:v|в|вольт)\b", re.IGNORECASE)
-START_CURRENT_RE = re.compile(r"\b(?P<value>[3-9]\d{2}|1\d{3})\s*(?:a|а)\b", re.IGNORECASE)
-OEM_RE = re.compile(r"\b(?=[A-ZА-Я0-9-]{5,}\b)(?=.*\d)[A-ZА-Я0-9]+(?:-[A-ZА-Я0-9]+)+\b", re.IGNORECASE)
+TIRE_SIZE_RE = re.compile(
+    r"\b(?P<width>\d{3})\s*/\s*(?P<profile>\d{2,3})\s*(?:ZR|R)?\s*(?P<diameter>\d{2}(?:[.,]\d)?)\b",
+    re.IGNORECASE,
+)
+VOLUME_RE = re.compile(r"\b(?P<value>\d+(?:[.,]\d+)?)\s*(?P<unit>мл|ml|л|l|литр(?:а|ов)?)\b", re.IGNORECASE)
+OEM_LABEL_RE = re.compile(
+    r"(?:\boe\b|\boem\b|о[еe]м|оригинальн(?:ый|ые)?\s+номер(?:а)?|кросс(?:[-\s]?номер)?|аналог(?:и)?)"
+    r"[:\s#№-]*(?P<codes>[A-ZА-Я0-9][A-ZА-Я0-9\s,;./_-]{3,120})",
+    re.IGNORECASE,
+)
+OEM_CODE_RE = re.compile(r"\b(?=[A-ZА-Я0-9-]{5,}\b)(?=.*\d)[A-ZА-Я0-9]{2,}(?:[-/][A-ZА-Я0-9]{2,})+\b", re.IGNORECASE)
+COMPACT_OEM_RE = re.compile(r"\b(?=[A-Z0-9]{6,14}\b)(?=.*\d)[A-Z]{1,5}\d[A-Z0-9]{3,}\b", re.IGNORECASE)
 
 
 def q_ident(name: str) -> str:
@@ -154,202 +157,177 @@ def read_table(conn, schema: str, table: str, load_id: str | None = None) -> pd.
     return pd.read_sql_query(sql, conn)
 
 
-def _empty(value) -> bool:
+def read_table_chunks(conn, schema: str, table: str, load_id: str | None = None, chunksize: int = 50_000):
+    sql = f"SELECT * FROM {q_ident(schema)}.{q_ident(table)}"
+    params = None
+    if load_id:
+        sql += " WHERE load_id = %s"
+        params = (load_id,)
+    yield from pd.read_sql_query(sql, conn, params=params, chunksize=chunksize)
+
+
+def empty_value(value) -> bool:
     if pd.isna(value):
         return True
     return str(value).strip() == ""
 
 
-def _text(row: pd.Series) -> str:
+def row_text(row: pd.Series) -> str:
     parts = []
-    for column in ("product_name", "normalized_name", "description"):
+    for column in (
+        "product_name",
+        "normalized_name",
+        "description",
+        "additional_information",
+        "features",
+        "source_url",
+    ):
         value = row.get(column)
-        if not _empty(value):
+        if not empty_value(value):
             parts.append(str(value))
     return " ".join(parts)
 
 
-def _fill_missing(df: pd.DataFrame, column: str, extractor) -> None:
+def ensure_columns(df: pd.DataFrame, table: str) -> None:
+    expected: list[str] = []
+    if "tires" in table:
+        expected.extend(["season", "tire_width", "tire_profile", "tire_diameter"])
+    if "oils" in table:
+        expected.extend(["package_type"])
+    if "batteries" in table:
+        expected.extend(["polarity", "terminal_type"])
+    if "filters" in table:
+        expected.extend(["oem_number"])
+    for column in expected:
+        if column not in df.columns:
+            df[column] = None
+
+
+def fill_missing(df: pd.DataFrame, column: str, extractor) -> None:
     if column not in df.columns:
         return
-    mask = df[column].apply(_empty)
+    mask = df[column].apply(empty_value)
     if not mask.any():
         return
-    df.loc[mask, column] = df.loc[mask].apply(lambda row: extractor(_text(row)), axis=1)
+    df.loc[mask, column] = df.loc[mask].apply(lambda row: extractor(row_text(row), row), axis=1)
 
 
-def _extract_tire_size(text: str, part: str):
+def extract_tire_size_part(text: str, part: str):
     match = TIRE_SIZE_RE.search(text)
     if not match:
         return None
-    value = match.group(part)
+    value = match.group(part).replace(",", ".")
     try:
         return float(value)
     except ValueError:
         return None
 
 
-def _extract_season(text: str) -> str | None:
+def extract_tire_season(text: str, _row: pd.Series | None = None) -> str | None:
     value = text.lower()
-    if any(token in value for token in ("всесез", "all season", "all-season", "allseason")):
+    if any(token in value for token in ("всесез", "all season", "all-season", "allseason", "4s")):
         return "all_season"
-    if any(token in value for token in ("зим", "winter", "шип")):
+    if any(token in value for token in ("зим", "winter", "ice", "snow", "шип")):
         return "winter"
     if any(token in value for token in ("лет", "summer")):
         return "summer"
     return None
 
 
-def _extract_speed_index(text: str) -> str | None:
-    match = TIRE_SPEED_RE.search(text.upper().replace("Н", "H").replace("Т", "T"))
-    if not match:
-        return None
-    speed = match.group("speed")
-    return speed if speed in {"Q", "R", "S", "T", "H", "V", "W", "Y", "Z"} else None
-
-
-def _extract_load_index(text: str) -> str | None:
-    match = TIRE_LOAD_RE.search(text.upper().replace("Н", "H").replace("Т", "T"))
-    return match.group("load") if match else None
-
-
-def _extract_viscosity(text: str) -> str | None:
-    match = VISCOSITY_RE.search(text)
-    if not match:
-        return None
-    value = re.sub(r"\s+", "", match.group("visc").upper().replace("–", "-"))
-    return re.sub(r"(\dW)-?(\d)", r"\1-\2", value)
-
-
-def _extract_volume(text: str) -> float | None:
-    match = VOLUME_RE.search(text)
-    if not match:
-        return None
-    value = float(match.group("value").replace(",", "."))
-    unit = match.group("unit").lower()
-    return round(value / 1000, 3) if unit in {"мл", "ml"} else value
-
-
-def _extract_oil_type(text: str) -> str | None:
+def extract_oil_package_type(text: str, row: pd.Series) -> str | None:
     value = text.lower()
-    if any(token in value for token in ("полусинтет", "semi synthetic", "semi-synthetic")):
-        return "semi-synthetic"
-    if any(token in value for token in ("синтет", "synthetic")):
-        return "synthetic"
-    if any(token in value for token in ("минерал", "mineral")):
-        return "mineral"
-    return None
-
-
-def _extract_engine_type(text: str) -> str | None:
-    value = text.lower()
-    if any(token in value for token in ("дизель", "diesel")) and any(token in value for token in ("бенз", "gasoline", "petrol")):
-        return "gasoline/diesel"
-    if any(token in value for token in ("дизель", "diesel")):
-        return "diesel"
-    if any(token in value for token in ("бенз", "gasoline", "petrol")):
-        return "gasoline"
-    if any(token in value for token in ("2t", "2-т", "двухтакт")):
-        return "2-stroke"
-    if any(token in value for token in ("4t", "4-т", "четырехтакт", "четырёхтакт")):
-        return "4-stroke"
-    return None
-
-
-def _extract_package_type(text: str) -> str | None:
-    value = text.lower()
-    if any(token in value for token in ("канистр", "canister")):
-        return "canister"
-    if any(token in value for token in ("бутыл", "bottle")):
-        return "bottle"
-    if any(token in value for token in ("бочк", "barrel")):
+    if any(token in value for token in ("бочка", "бочк", "barrel", "drum")):
         return "barrel"
+    if any(token in value for token in ("канистра", "канистр", "canister", "кан.")):
+        return "canister"
+    if any(token in value for token in ("бутылка", "бутыл", "bottle", "флакон")):
+        return "bottle"
+
+    volume = row.get("volume_liters")
+    if empty_value(volume):
+        match = VOLUME_RE.search(text)
+        if match:
+            try:
+                parsed = float(match.group("value").replace(",", "."))
+            except ValueError:
+                parsed = None
+            if parsed is not None:
+                volume = parsed / 1000 if match.group("unit").lower() in {"мл", "ml"} else parsed
+    try:
+        volume_float = float(volume)
+    except (TypeError, ValueError):
+        return None
+    if volume_float >= 20:
+        return "barrel"
+    if volume_float >= 4:
+        return "canister"
+    if volume_float > 0:
+        return "bottle"
     return None
 
 
-def _extract_number(pattern: re.Pattern[str], text: str) -> float | None:
-    match = pattern.search(text)
-    return float(match.group("value")) if match else None
-
-
-def _extract_polarity(text: str) -> str | None:
+def extract_battery_polarity(text: str, _row: pd.Series | None = None) -> str | None:
     value = text.lower()
-    if any(token in value for token in ("обрат", "reverse")):
+    if any(token in value for token in ("обратная", "обратн", "reverse", "r+")):
         return "reverse"
-    if any(token in value for token in ("прям", "direct", "straight")):
+    if any(token in value for token in ("прямая", "прям", "direct", "straight", "l+")):
+        return "direct"
+    if re.search(r"\b0\b", value):
+        return "reverse"
+    if re.search(r"\b1\b", value):
         return "direct"
     return None
 
 
-def _extract_battery_type(text: str) -> str | None:
+def extract_battery_terminal_type(text: str, _row: pd.Series | None = None) -> str | None:
     value = text.lower()
-    for token in ("agm", "efb", "gel"):
-        if token in value:
-            return token.upper()
-    if "кальц" in value or "calcium" in value:
-        return "calcium"
-    return None
-
-
-def _extract_terminal_type(text: str) -> str | None:
-    value = text.lower()
-    if any(token in value for token in ("евро", "euro")):
+    if any(token in value for token in ("евро", "euro", "standard terminal", "стандартные клем")):
         return "euro"
-    if any(token in value for token in ("азия", "asia", "asian")):
+    if any(token in value for token in ("азия", "asia", "asian", "тонкие клем", "малые клем")):
         return "asia"
+    if any(token in value for token in ("болт", "bolt", "под болт")):
+        return "bolt"
     return None
 
 
-def _extract_filter_type(text: str) -> str | None:
-    value = text.lower()
-    if "салон" in value or "cabin" in value:
-        return "cabin"
-    if "воздуш" in value or "air" in value:
-        return "air"
-    if "масл" in value or "oil" in value:
-        return "oil"
-    if "топлив" in value or "fuel" in value:
-        return "fuel"
-    return None
+def extract_oem_number(text: str, _row: pd.Series | None = None) -> str | None:
+    candidates: list[str] = []
+    upper = text.upper()
+    for label_match in OEM_LABEL_RE.finditer(upper):
+        labeled = label_match.group("codes")
+        candidates.extend(OEM_CODE_RE.findall(labeled))
+        candidates.extend(COMPACT_OEM_RE.findall(labeled))
+    candidates.extend(OEM_CODE_RE.findall(upper))
+
+    cleaned = []
+    for candidate in candidates:
+        candidate = candidate.strip(" .,:;()[]{}")
+        if len(candidate) < 5:
+            continue
+        if candidate.isdigit():
+            continue
+        cleaned.append(candidate)
+    return "; ".join(dict.fromkeys(cleaned[:8])) or None
 
 
-def _extract_oem_number(text: str) -> str | None:
-    match = OEM_RE.search(text.upper())
-    return match.group(0) if match else None
-
-
-def enrich_from_product_name(df: pd.DataFrame, table: str) -> pd.DataFrame:
-    if "product_name" not in df.columns and "normalized_name" not in df.columns:
-        return df
+def enrich_extracted_attrs(df: pd.DataFrame, table: str) -> pd.DataFrame:
+    ensure_columns(df, table)
 
     if "tires" in table:
-        _fill_missing(df, "tire_width", lambda text: _extract_tire_size(text, "width"))
-        _fill_missing(df, "tire_profile", lambda text: _extract_tire_size(text, "profile"))
-        _fill_missing(df, "tire_diameter", lambda text: _extract_tire_size(text, "diameter"))
-        _fill_missing(df, "season", _extract_season)
-        _fill_missing(df, "speed_index", _extract_speed_index)
-        _fill_missing(df, "load_index", _extract_load_index)
-        _fill_missing(df, "studded", lambda text: True if re.search(r"\b(шип|studded)\b", text, re.IGNORECASE) else None)
-        _fill_missing(df, "runflat", lambda text: True if re.search(r"\b(run\s*flat|runflat|rof|rft)\b", text, re.IGNORECASE) else None)
+        fill_missing(df, "season", extract_tire_season)
+        fill_missing(df, "tire_width", lambda text, _row: extract_tire_size_part(text, "width"))
+        fill_missing(df, "tire_profile", lambda text, _row: extract_tire_size_part(text, "profile"))
+        fill_missing(df, "tire_diameter", lambda text, _row: extract_tire_size_part(text, "diameter"))
 
     if "oils" in table:
-        _fill_missing(df, "viscosity", _extract_viscosity)
-        _fill_missing(df, "volume_liters", _extract_volume)
-        _fill_missing(df, "oil_type", _extract_oil_type)
-        _fill_missing(df, "engine_type", _extract_engine_type)
-        _fill_missing(df, "package_type", _extract_package_type)
+        fill_missing(df, "package_type", extract_oil_package_type)
 
     if "batteries" in table:
-        _fill_missing(df, "capacity_ah", lambda text: _extract_number(CAPACITY_RE, text))
-        _fill_missing(df, "voltage_v", lambda text: _extract_number(VOLTAGE_RE, text))
-        _fill_missing(df, "start_current_a", lambda text: _extract_number(START_CURRENT_RE, text))
-        _fill_missing(df, "polarity", _extract_polarity)
-        _fill_missing(df, "battery_type", _extract_battery_type)
-        _fill_missing(df, "terminal_type", _extract_terminal_type)
+        fill_missing(df, "polarity", extract_battery_polarity)
+        fill_missing(df, "terminal_type", extract_battery_terminal_type)
 
     if "filters" in table:
-        _fill_missing(df, "filter_type", _extract_filter_type)
-        _fill_missing(df, "oem_number", _extract_oem_number)
+        fill_missing(df, "oem_number", extract_oem_number)
 
     return df
 
@@ -399,20 +377,16 @@ def clean_table(df: pd.DataFrame, table: str) -> pd.DataFrame:
     if "engine_type" in df.columns:
         df["engine_type"] = df["engine_type"].apply(funcs["normalize_engine_type"])
 
-    df = enrich_from_product_name(df, table)
+    df = enrich_extracted_attrs(df, table)
 
-    if "viscosity" in df.columns:
-        df["viscosity"] = df["viscosity"].apply(funcs["normalize_viscosity"])
-    if "volume_liters" in df.columns:
-        df["volume_liters"] = df["volume_liters"].apply(funcs["normalize_volume"])
-    if "oil_type" in df.columns:
-        df["oil_type"] = df["oil_type"].apply(funcs["normalize_oil_type"])
-    if "engine_type" in df.columns:
-        df["engine_type"] = df["engine_type"].apply(funcs["normalize_engine_type"])
     if "season" in df.columns:
         df["season"] = df["season"].apply(funcs["normalize_season"])
-    if "speed_index" in df.columns:
-        df["speed_index"] = df["speed_index"].apply(funcs["normalize_speed_index"])
+    for column in ["tire_diameter", "wheel_diameter"]:
+        if column in df.columns:
+            df[column] = df[column].apply(funcs["normalize_diameter"])
+    for column in ["tire_width", "tire_profile", "wheel_width", "capacity_ah", "voltage_v", "start_current_a"]:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
 
     subset = [column for column in ["load_id", "source", "source_product_id", "source_url"] if column in df.columns]
     if "load_id" not in subset:
@@ -484,13 +458,13 @@ def ensure_table(cur, schema: str, table: str, df: pd.DataFrame) -> None:
             existing.add(column)
 
 
-def append_table(cur, schema: str, table: str, df: pd.DataFrame) -> None:
+def append_table(cur, schema: str, table: str, df: pd.DataFrame, *, delete_load_ids: bool = True) -> None:
     ensure_table(cur, schema, table, df)
 
     if df.empty:
         return
 
-    if "load_id" in df.columns:
+    if delete_load_ids and "load_id" in df.columns:
         load_ids = [value for value in df["load_id"].dropna().unique().tolist()]
         if load_ids:
             cur.execute(
@@ -529,11 +503,18 @@ def clean_database(
 
             cleaned_tables = set()
             for table in raw_tables:
-                raw_df = read_table(conn, raw_schema, table, load_id=load_id)
-                print(f"\n[{table}] raw rows={len(raw_df)}, columns={len(raw_df.columns)}", flush=True)
-                clean_df = clean_table(raw_df, table)
-                print(f"[{table}] clean rows={len(clean_df)}, columns={len(clean_df.columns)}", flush=True)
-                append_table(cur, clean_schema, table, clean_df)
+                raw_rows = 0
+                clean_rows = 0
+                first_chunk = True
+                for raw_df in read_table_chunks(conn, raw_schema, table, load_id=load_id):
+                    raw_rows += len(raw_df)
+                    if first_chunk:
+                        print(f"\n[{table}] columns={len(raw_df.columns)}", flush=True)
+                    clean_df = clean_table(raw_df, table)
+                    clean_rows += len(clean_df)
+                    append_table(cur, clean_schema, table, clean_df, delete_load_ids=first_chunk)
+                    first_chunk = False
+                print(f"[{table}] raw rows={raw_rows}, clean rows={clean_rows}", flush=True)
                 cleaned_tables.add(table)
 
             if cleaned_tables:

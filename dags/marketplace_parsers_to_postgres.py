@@ -58,6 +58,15 @@ def config_value(name: str, default: str) -> str:
     return optional_config_value(name) or default
 
 
+def required_config_value(name: str, *fallback_names: str) -> str:
+    for candidate in (name, *fallback_names):
+        value = optional_config_value(candidate)
+        if value not in (None, ""):
+            return value
+    names = ", ".join((name, *fallback_names))
+    raise RuntimeError(f"Required database config is missing. Set one of: {names}")
+
+
 def env_flag(name: str, default: bool = False) -> bool:
     value = config_value(name, "true" if default else "false").strip().lower()
     return value in {"1", "true", "yes", "y", "on"}
@@ -73,7 +82,7 @@ def run_cmd(args: list[str], extra_env: dict[str, str] | None = None) -> subproc
         if str(path)
     )
     print(f"Running command: {' '.join(args)}", flush=True)
-    result = subprocess.run(
+    process = subprocess.Popen(
         args,
         cwd=str(PROJECT_ROOT),
         env=command_env,
@@ -81,11 +90,13 @@ def run_cmd(args: list[str], extra_env: dict[str, str] | None = None) -> subproc
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
-    if result.stdout:
-        print(result.stdout, flush=True)
-    if result.returncode:
-        raise subprocess.CalledProcessError(result.returncode, args, output=result.stdout)
-    return result
+    assert process.stdout is not None
+    for line in process.stdout:
+        print(line, end="", flush=True)
+    returncode = process.wait()
+    if returncode:
+        raise subprocess.CalledProcessError(returncode, args)
+    return subprocess.CompletedProcess(args, returncode)
 
 
 def current_load_id() -> str:
@@ -305,14 +316,11 @@ def postgres_config_for_new_database() -> PostgresConfig:
     # still exist with a local-only host like "postgres", which is not
     # resolvable in the server deployment.
     return PostgresConfig(
-        host=config_value("RAW_PGHOST", config_value("PGHOST", "fdrivedataairflow-fdrive-ucfmoa")),
+        host=required_config_value("RAW_PGHOST", "PGHOST"),
         port=int(config_value("RAW_PGPORT", config_value("PGPORT", "5432"))),
-        user=config_value("RAW_PGUSER", config_value("PGUSER", "postgres")),
-        password=config_value("RAW_PGPASSWORD", config_value("PGPASSWORD", "scSD6QCahyMhCsdxyW10")),
-        database=config_value(
-            "MARKETPLACE_PGDATABASE",
-            config_value("RAW_PGDATABASE", config_value("PGDATABASE", "fdrive")),
-        ),
+        user=required_config_value("RAW_PGUSER", "PGUSER"),
+        password=required_config_value("RAW_PGPASSWORD", "PGPASSWORD"),
+        database=required_config_value("MARKETPLACE_PGDATABASE", "RAW_PGDATABASE", "PGDATABASE"),
     )
 
 
@@ -521,11 +529,25 @@ def run_matching_pipeline() -> None:
     )
 
 
-def run_build_matching_catalog_tables() -> None:
+def run_build_matching_attributes() -> None:
     run_cmd(
         [
             sys.executable,
-            str(SCRIPTS_DIR / "build_matching_catalog_tables.py"),
+            str(SCRIPTS_DIR / "build_matching_attributes.py"),
+            "--clean-schema",
+            config_value("CLEAN_SCHEMA", "cleanned"),
+            "--match-schema",
+            config_value("MATCH_SCHEMA", "matching"),
+        ],
+        extra_env=matching_postgres_env(postgres_config_for_new_database()),
+    )
+
+
+def run_build_sku_price_history() -> None:
+    run_cmd(
+        [
+            sys.executable,
+            str(SCRIPTS_DIR / "build_sku_price_history.py"),
             "--clean-schema",
             config_value("CLEAN_SCHEMA", "cleanned"),
             "--match-schema",
@@ -542,6 +564,18 @@ def validate_matching_quality() -> None:
     schema = config_value("MATCH_SCHEMA", "matching")
     min_multi_source_pct = float(config_value("QUALITY_MIN_MULTI_SOURCE_PCT", "0.005"))
     failures = []
+    required_tables = (
+        "categories",
+        "skus",
+        "sku_source_mapping",
+        "match_explanations",
+        "attributes",
+        "attribute_groups",
+        "attributes_attribute_groups",
+        "category_attributes",
+        "sku_attribute_values",
+        "sku_price_history",
+    )
 
     with psycopg2.connect(
         host=config.host,
@@ -551,7 +585,7 @@ def validate_matching_quality() -> None:
         dbname=config.database,
     ) as conn:
         with conn.cursor() as cur:
-            for table in ("categories", "skus", "sku_source_mapping", "attributes", "attribute_groups", "category_attributes", "sku_attribute_values", "sku_price_history"):
+            for table in required_tables:
                 cur.execute(
                     """
                     SELECT EXISTS (
@@ -568,7 +602,16 @@ def validate_matching_quality() -> None:
                 cur.execute(f"SELECT COUNT(*) FROM {q_ident(schema)}.{q_ident(table)}")
                 count = cur.fetchone()[0]
                 print(f"[quality][{schema}.{table}] rows={count}", flush=True)
-                if table in {"categories", "skus", "sku_source_mapping", "attributes", "attribute_groups"} and count == 0:
+                if table in {
+                    "categories",
+                    "skus",
+                    "sku_source_mapping",
+                    "attributes",
+                    "attribute_groups",
+                    "category_attributes",
+                    "sku_attribute_values",
+                    "sku_price_history",
+                } and count == 0:
                     failures.append(f"{schema}.{table} is empty")
 
             cur.execute(
@@ -669,10 +712,15 @@ with DAG(
         execution_timeout=timedelta(hours=6),
         trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
     )
-    build_catalog_tables = PythonOperator(
-        task_id="build_matching_catalog_tables",
-        python_callable=run_build_matching_catalog_tables,
+    build_matching_attributes = PythonOperator(
+        task_id="build_matching_attributes",
+        python_callable=run_build_matching_attributes,
         execution_timeout=timedelta(hours=2),
+    )
+    build_sku_price_history = PythonOperator(
+        task_id="build_sku_price_history",
+        python_callable=run_build_sku_price_history,
+        execution_timeout=timedelta(hours=1),
     )
     validate_matching = PythonOperator(
         task_id="validate_matching_quality",
@@ -691,4 +739,4 @@ with DAG(
 
     choose_matching_path >> categories_already_exist >> run_matching
     choose_matching_path >> ensure_categories_task >> run_matching
-    run_matching >> build_catalog_tables >> validate_matching >> end
+    run_matching >> build_matching_attributes >> build_sku_price_history >> validate_matching >> end
